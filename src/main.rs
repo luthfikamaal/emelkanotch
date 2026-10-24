@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use chrono::{Datelike, Local, NaiveDate, TimeZone, Timelike};
 use eframe::egui::{
     self, pos2, vec2, Align2, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId,
     Painter, Pos2, Rect, RichText, Sense, Shape, Stroke, StrokeKind, Ui, UiBuilder,
@@ -58,6 +59,11 @@ const CARD: Color32 = Color32::from_rgb(15, 16, 21);
 const PURPLE: Color32 = Color32::from_rgb(170, 140, 255);
 const GREEN: Color32 = Color32::from_rgb(130, 220, 170);
 const WARN: Color32 = Color32::from_rgb(255, 125, 105);
+
+// ---------- input fields (task row) ----------
+const FIELD_H: f32 = 30.0;
+const FIELD_R: u8 = 8;
+const DUE_W: f32 = 132.0;
 
 // =====================================================================
 // Shared media state (filled by background thread)
@@ -994,6 +1000,131 @@ fn spawn_updater(ctx: egui::Context, upd: Arc<Mutex<Upd>>, notifs: Arc<Mutex<Not
 }
 
 // =====================================================================
+// Todo (stored in %APPDATA%\EmelkaNotch\todos.db)
+// =====================================================================
+
+#[derive(Clone)]
+struct Todo {
+    id: u64,
+    text: String,
+    done: bool,
+    due: Option<i64>, // unix seconds
+    notified: bool,
+}
+
+#[derive(Default)]
+struct TodoState {
+    items: Vec<Todo>,
+    next_id: u64,
+}
+
+fn todo_db_path() -> Option<PathBuf> {
+    let dir = PathBuf::from(std::env::var_os("APPDATA")?).join("EmelkaNotch");
+    let _ = std::fs::create_dir_all(&dir);
+    Some(dir.join("todos.db"))
+}
+
+fn open_todo_db() -> rusqlite::Result<Connection> {
+    let p = todo_db_path().ok_or(rusqlite::Error::InvalidPath(PathBuf::new()))?;
+    let conn = Connection::open(p)?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS todos (
+            id       INTEGER PRIMARY KEY,
+            text     TEXT NOT NULL,
+            done     INTEGER NOT NULL DEFAULT 0,
+            due      INTEGER,
+            notified INTEGER NOT NULL DEFAULT 0
+        );",
+    )?;
+    Ok(conn)
+}
+
+fn load_todos() -> TodoState {
+    let mut st = TodoState::default();
+    let Ok(conn) = open_todo_db() else { return st };
+    let Ok(mut stmt) = conn.prepare("SELECT id, text, done, due, notified FROM todos ORDER BY id")
+    else {
+        return st;
+    };
+    let Ok(rows) = stmt.query_map([], |r| {
+        Ok(Todo {
+            id: r.get::<_, i64>(0)? as u64,
+            text: r.get(1)?,
+            done: r.get::<_, i64>(2)? != 0,
+            due: r.get(3)?,
+            notified: r.get::<_, i64>(4)? != 0,
+        })
+    }) else {
+        return st;
+    };
+    for t in rows.flatten() {
+        st.next_id = st.next_id.max(t.id);
+        st.items.push(t);
+    }
+    st
+}
+
+fn save_todos(items: &[Todo]) {
+    let Ok(mut conn) = open_todo_db() else { return };
+    let Ok(tx) = conn.transaction() else { return };
+    let _ = tx.execute("DELETE FROM todos", []);
+    for t in items {
+        let _ = tx.execute(
+            "INSERT INTO todos (id, text, done, due, notified) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![t.id as i64, t.text, t.done as i64, t.due, t.notified as i64],
+        );
+    }
+    let _ = tx.commit();
+}
+
+fn fmt_due(ts: i64) -> String {
+    let Some(dt) = Local.timestamp_opt(ts, 0).single() else {
+        return String::new();
+    };
+    let today = Local::now().date_naive();
+    let d = dt.date_naive();
+    let day = if d == today {
+        "Today".to_string()
+    } else if Some(d) == today.succ_opt() {
+        "Tomorrow".to_string()
+    } else {
+        dt.format("%d %b").to_string()
+    };
+    format!("{day} {}", dt.format("%H:%M"))
+}
+
+/// Checks every second; when a todo is due, sends a notification to the pill.
+fn spawn_todo_worker(
+    ctx: egui::Context,
+    todos: Arc<Mutex<TodoState>>,
+    notifs: Arc<Mutex<NotifState>>,
+) {
+    thread::spawn(move || loop {
+        thread::sleep(Duration::from_secs(1));
+        let now = Local::now().timestamp();
+        let mut fired: Vec<String> = Vec::new();
+        {
+            let mut st = todos.lock().unwrap();
+            for t in st.items.iter_mut() {
+                if !t.done && !t.notified && t.due.map_or(false, |d| d <= now) {
+                    t.notified = true;
+                    fired.push(t.text.clone());
+                }
+            }
+            if !fired.is_empty() {
+                save_todos(&st.items);
+            }
+        }
+        if !fired.is_empty() {
+            for text in fired {
+                push_notice(&notifs, "Reminder", text);
+            }
+            ctx.request_repaint();
+        }
+    });
+}
+
+// =====================================================================
 // System info helpers
 // =====================================================================
 
@@ -1003,30 +1134,32 @@ struct DiskInfo {
     total_gb: f64,
 }
 
-fn read_disk() -> Option<DiskInfo> {
+fn read_disks() -> Vec<DiskInfo> {
     let disks = Disks::new_with_refreshed_list();
-    let d = disks
-        .list()
-        .iter()
-        .find(|d| {
-            d.mount_point()
-                .to_string_lossy()
-                .to_uppercase()
-                .starts_with("C:")
-        })
-        .or_else(|| disks.list().first())?;
     let gb = 1_073_741_824.0;
-    let total = d.total_space() as f64 / gb;
-    let free = d.available_space() as f64 / gb;
-    Some(DiskInfo {
-        name: d
+    let mut out: Vec<DiskInfo> = Vec::new();
+    for d in disks.list() {
+        let total = d.total_space() as f64 / gb;
+        if total <= 0.0 {
+            continue; // empty CD-ROM etc.
+        }
+        let name = d
             .mount_point()
             .to_string_lossy()
             .trim_end_matches('\\')
-            .to_string(),
-        used_gb: (total - free).max(0.0),
-        total_gb: total,
-    })
+            .to_string();
+        if out.iter().any(|x| x.name == name) {
+            continue;
+        }
+        let free = d.available_space() as f64 / gb;
+        out.push(DiskInfo {
+            name,
+            used_gb: (total - free).max(0.0),
+            total_gb: total,
+        });
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
 }
 
 fn fmt_gb(g: f64) -> String {
@@ -1113,25 +1246,19 @@ fn sparkline(p: &Painter, r: Rect, data: &VecDeque<f32>, color: Color32) {
     p.add(Shape::line(pts, Stroke::new(1.6, color)));
 }
 
-fn donut(p: &Painter, c: Pos2, r: f32, frac: f32, color: Color32) {
-    p.circle_stroke(c, r, Stroke::new(7.0, TRACK));
-    let n = 64;
-    let start = -std::f32::consts::FRAC_PI_2;
-    let sweep = std::f32::consts::TAU * frac.clamp(0.0, 1.0);
-    let pts: Vec<Pos2> = (0..=n)
-        .map(|i| {
-            let a = start + sweep * i as f32 / n as f32;
-            c + vec2(a.cos(), a.sin()) * r
-        })
-        .collect();
-    if frac > 0.0 {
-        p.add(Shape::line(pts, Stroke::new(7.0, color)));
-    }
-}
-
 // =====================================================================
 // Helpers
 // =====================================================================
+
+fn greeting() -> String {
+    match Local::now().hour() {
+        5..=11 => "Good morning",
+        12..=16 => "Good afternoon",
+        17..=21 => "Good evening",
+        _ => "Hello, night owl",
+    }
+    .to_string()
+}
 
 fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
@@ -1430,6 +1557,138 @@ fn bar(ui: &mut Ui, width: f32, frac: f32, fill: Color32) -> egui::Response {
     resp
 }
 
+fn ease_out(t: f32) -> f32 {
+    1.0 - (1.0 - t.clamp(0.0, 1.0)).powi(3)
+}
+
+/// A child Ui placed at `rect` shifted by `dx`, clipped to `rect`, with its own opacity.
+fn slide_child(ui: &mut Ui, rect: Rect, dx: f32, alpha: f32, salt: impl std::hash::Hash) -> Ui {
+    let mut c = ui.new_child(
+        UiBuilder::new()
+            .id_salt(salt)
+            .max_rect(rect.translate(vec2(dx, 0.0)))
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+    );
+    c.set_clip_rect(rect.intersect(ui.clip_rect()));
+    c.set_opacity(alpha.clamp(0.0, 1.0));
+    c
+}
+
+fn field_fill(hovered: bool, focused: bool) -> Color32 {
+    if focused {
+        Color32::from_rgb(30, 32, 40)
+    } else if hovered {
+        Color32::from_rgb(25, 26, 33)
+    } else {
+        Color32::from_rgb(20, 21, 27)
+    }
+}
+
+fn btn_rect(ui: &mut Ui, rect: Rect, id: impl std::hash::Hash) -> egui::Response {
+    ui.interact(rect, egui::Id::new(id), Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Rounded text button. Returns true when clicked (never when disabled).
+fn text_btn(
+    ui: &mut Ui,
+    p: &Painter,
+    rect: Rect,
+    label: &str,
+    id: &str,
+    primary: bool,
+    enabled: bool,
+) -> bool {
+    let r = btn_rect(ui, rect, ("pk_btn", id));
+    let hov = r.hovered() && enabled;
+    let (fill, col) = if !enabled {
+        (TRACK, DIM)
+    } else if primary {
+        (if hov { Color32::WHITE } else { TEXT }, BG)
+    } else {
+        (field_fill(hov, false), if hov { TEXT } else { MUTED })
+    };
+    p.rect_filled(rect, CornerRadius::same(FIELD_R), fill);
+    p.text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        label,
+        semibold(11.5),
+        col,
+    );
+    r.clicked() && enabled
+}
+
+fn arrow_btn(ui: &mut Ui, p: &Painter, rect: Rect, dir: f32, id: &str) -> bool {
+    let r = btn_rect(ui, rect, ("pk_arrow", id));
+    if r.hovered() {
+        p.rect_filled(rect, CornerRadius::same(6), Color32::from_rgb(32, 34, 42));
+    }
+    let c = rect.center();
+    let s = 4.0;
+    p.add(Shape::convex_polygon(
+        vec![
+            pos2(c.x - dir * s * 0.6, c.y - s),
+            pos2(c.x - dir * s * 0.6, c.y + s),
+            pos2(c.x + dir * s * 0.9, c.y),
+        ],
+        if r.hovered() { TEXT } else { MUTED },
+        Stroke::NONE,
+    ));
+    r.clicked()
+}
+
+/// [-]  09  [+]  stepper. Wraps around; scroll wheel works too.
+fn stepper(
+    ui: &mut Ui,
+    p: &Painter,
+    origin: Pos2,
+    val: &mut u32,
+    modulo: u32,
+    step: u32,
+    id: &str,
+) {
+    let full = Rect::from_min_size(origin, vec2(96.0, 28.0));
+    p.rect_filled(
+        full,
+        CornerRadius::same(FIELD_R),
+        field_fill(ui.rect_contains_pointer(full), false),
+    );
+    let minus = Rect::from_min_size(origin, vec2(26.0, 28.0));
+    let plus = Rect::from_min_size(pos2(origin.x + 70.0, origin.y), vec2(26.0, 28.0));
+    let mut delta = 0i32;
+    if btn_rect(ui, minus, ("pk_minus", id)).clicked() {
+        delta = -1;
+    }
+    if btn_rect(ui, plus, ("pk_plus", id)).clicked() {
+        delta = 1;
+    }
+    if ui.rect_contains_pointer(full) {
+        let dy = ui.input(|i| i.raw_scroll_delta.y);
+        if dy > 0.0 {
+            delta = 1;
+        } else if dy < 0.0 {
+            delta = -1;
+        }
+    }
+    if delta != 0 {
+        *val = (*val as i32 + delta * step as i32).rem_euclid(modulo as i32) as u32;
+    }
+    let st = Stroke::new(1.4, MUTED);
+    let mc = minus.center();
+    p.line_segment([mc - vec2(4.0, 0.0), mc + vec2(4.0, 0.0)], st);
+    let pc = plus.center();
+    p.line_segment([pc - vec2(4.0, 0.0), pc + vec2(4.0, 0.0)], st);
+    p.line_segment([pc - vec2(0.0, 4.0), pc + vec2(0.0, 4.0)], st);
+    p.text(
+        pos2(origin.x + 48.0, origin.y + 14.0),
+        Align2::CENTER_CENTER,
+        format!("{:02}", *val),
+        semibold(13.0),
+        TEXT,
+    );
+}
+
 // =====================================================================
 // App
 // =====================================================================
@@ -1439,6 +1698,7 @@ enum Section {
     Media,
     Alerts,
     System,
+    Todo,
 }
 
 /// What the collapsed pill is currently showing (already truncated + measured).
@@ -1485,8 +1745,27 @@ struct EmelkaNotch {
     last_refresh: Instant,
     cpu_hist: VecDeque<f32>,
     mem_hist: VecDeque<f32>,
-    disk: Option<DiskInfo>,
+    disks: Vec<DiskInfo>,
     last_disk: Instant,
+
+    // tasks
+    todos: Arc<Mutex<TodoState>>,
+    todo_text: String,
+    todo_due: Option<i64>,
+    picker_open: bool,
+    pk_date: NaiveDate,
+    pk_h: u32,
+    pk_m: u32,
+    pk_view: (i32, u32), // year, month shown in the calendar
+
+    // transitions
+    prev_section: Option<Section>,
+    tab_t: f32,
+    tab_dir: f32,
+    pk_anim: f32, // 0 = task list, 1 = date/time picker
+    cur_alpha: f32,
+    added: Option<(u64, Instant)>,
+    add_flash: Option<Instant>,
 }
 
 impl EmelkaNotch {
@@ -1511,6 +1790,9 @@ impl EmelkaNotch {
             );
         }
         spawn_updater(cc.egui_ctx.clone(), upd.clone(), notifs.clone());
+
+        let todos = Arc::new(Mutex::new(load_todos()));
+        spawn_todo_worker(cc.egui_ctx.clone(), todos.clone(), notifs.clone());
 
         let mut sys = System::new();
         sys.refresh_cpu_all();
@@ -1542,8 +1824,23 @@ impl EmelkaNotch {
             last_refresh: Instant::now(),
             cpu_hist: VecDeque::new(),
             mem_hist: VecDeque::new(),
-            disk: read_disk(),
+            disks: read_disks(),
             last_disk: Instant::now(),
+            todos,
+            todo_text: String::new(),
+            todo_due: None,
+            picker_open: false,
+            pk_date: Local::now().date_naive(),
+            pk_h: 9,
+            pk_m: 0,
+            pk_view: (Local::now().year(), Local::now().month()),
+            prev_section: None,
+            tab_t: 1.0,
+            tab_dir: 1.0,
+            pk_anim: 0.0,
+            cur_alpha: 1.0,
+            added: None,
+            add_flash: None,
         }
     }
 
@@ -1586,7 +1883,7 @@ impl EmelkaNotch {
         push_hist(&mut self.mem_hist, mem);
 
         if self.last_disk.elapsed() > Duration::from_secs(15) {
-            self.disk = read_disk();
+            self.disks = read_disks();
             self.last_disk = Instant::now();
         }
     }
@@ -1597,7 +1894,10 @@ impl EmelkaNotch {
             pos2(shape.left() - 4.0, 0.0),
             pos2(shape.right() + 4.0, shape.bottom() + 4.0),
         );
-        let inside = cursor_local(ctx).map_or(false, |c| hit.contains(c));
+        let over = cursor_local(ctx).map_or(false, |c| hit.contains(c));
+        // Keep the panel open while a text field has keyboard focus.
+        let typing = ctx.input(|i| i.focused) && ctx.memory(|m| m.focused().is_some());
+        let inside = over || (typing && self.open);
 
         if inside {
             self.last_inside = Instant::now();
@@ -1666,7 +1966,7 @@ impl EmelkaNotch {
             } else if media.available {
                 (1, media.title.clone(), None, None)
             } else {
-                (0, "EmelkaNotch".to_string(), None, None)
+                (0, greeting(), None, None)
             };
 
         let (app_id, icon) = notif
@@ -1839,6 +2139,7 @@ impl EmelkaNotch {
             );
             child.set_clip_rect(child.clip_rect().intersect(rect));
             child.set_opacity(panel_alpha);
+            self.cur_alpha = panel_alpha;
             self.draw_panel(&mut child, &media, pos_ms, &lyrics);
         }
     }
@@ -1850,8 +2151,16 @@ impl EmelkaNotch {
                 (Section::Media, "Media"),
                 (Section::Alerts, "Notification"),
                 (Section::System, "System"),
+                (Section::Todo, "Tasks"),
             ] {
-                if tab(ui, label, self.section == s) {
+                if tab(ui, label, self.section == s) && self.section != s {
+                    self.prev_section = Some(self.section);
+                    self.tab_dir = if (s as usize) > (self.section as usize) {
+                        1.0
+                    } else {
+                        -1.0
+                    };
+                    self.tab_t = 0.0;
                     self.section = s;
                 }
             }
@@ -1861,10 +2170,56 @@ impl EmelkaNotch {
         });
         ui.add_space(10.0);
 
-        match self.section {
+        let dt = ui.input(|i| i.stable_dt).min(0.05);
+        if self.prev_section.is_some() {
+            self.tab_t = (self.tab_t + dt / 0.30).min(1.0);
+            if self.tab_t >= 1.0 {
+                self.prev_section = None;
+            }
+        }
+        let content = ui.available_rect_before_wrap();
+        match self.prev_section {
+            Some(prev) => {
+                // Slide: old content leaves, new content enters from the side of the clicked tab.
+                let e = ease_out(self.tab_t);
+                let w = content.width();
+                let a = self.cur_alpha;
+                let mut old = slide_child(
+                    ui,
+                    content,
+                    -self.tab_dir * e * w,
+                    a * (1.0 - e),
+                    ("sec", prev as u8),
+                );
+                self.draw_section(&mut old, prev, media, pos_ms, lyrics);
+                let cur = self.section;
+                let mut new = slide_child(
+                    ui,
+                    content,
+                    self.tab_dir * (1.0 - e) * w,
+                    a * e,
+                    ("sec", cur as u8),
+                );
+                self.draw_section(&mut new, cur, media, pos_ms, lyrics);
+                ui.ctx().request_repaint();
+            }
+            None => self.draw_section(ui, self.section, media, pos_ms, lyrics),
+        }
+    }
+
+    fn draw_section(
+        &mut self,
+        ui: &mut Ui,
+        sec: Section,
+        media: &Media,
+        pos_ms: u64,
+        lyrics: &Lyrics,
+    ) {
+        match sec {
             Section::Media => self.media_section(ui, media, pos_ms, lyrics),
             Section::Alerts => self.alerts_section(ui),
             Section::System => self.system_section(ui),
+            Section::Todo => self.todo_section(ui),
         }
     }
 
@@ -2146,66 +2501,619 @@ impl EmelkaNotch {
                 MUTED,
             );
 
-            // Storage
+            // Storage (all drives)
             let (r, p) = card(ui, w, h);
-            match &self.disk {
-                Some(d) => {
+            if self.disks.is_empty() {
+                card_header(&p, r, "Storage", "");
+                p.text(
+                    r.center(),
+                    Align2::CENTER_CENTER,
+                    "No disk info",
+                    FontId::proportional(11.0),
+                    DIM,
+                );
+            } else {
+                let n = self.disks.len();
+                card_header(
+                    &p,
+                    r,
+                    "Storage",
+                    &format!("{n} drive{}", if n == 1 { "" } else { "s" }),
+                );
+                let shown = n.min(4);
+                let row_h = (88.0 / shown as f32).min(30.0);
+                let (x0, x1) = (r.left() + 12.0, r.right() - 12.0);
+                for (i, d) in self.disks.iter().take(shown).enumerate() {
+                    let top = r.top() + 36.0 + i as f32 * row_h;
                     let frac = (d.used_gb / d.total_gb.max(0.001)) as f32;
-                    card_header(&p, r, "Storage", &d.name);
-                    let c = pos2(r.left() + 46.0, r.top() + 83.0);
                     let col = if frac > 0.9 { WARN } else { GREEN };
-                    donut(&p, c, 29.0, frac, col);
                     p.text(
-                        c,
-                        Align2::CENTER_CENTER,
-                        format!("{:.0}%", frac * 100.0),
-                        semibold(13.0),
-                        TEXT,
-                    );
-
-                    let x = r.left() + 90.0;
-                    let small_f = FontId::proportional(10.0);
-                    p.text(
-                        pos2(x, c.y - 22.0),
+                        pos2(x0, top + 6.0),
                         Align2::LEFT_CENTER,
-                        "Used",
-                        small_f.clone(),
-                        DIM,
-                    );
-                    p.text(
-                        pos2(x, c.y - 9.0),
-                        Align2::LEFT_CENTER,
-                        fmt_gb(d.used_gb),
-                        semibold(12.0),
+                        &d.name,
+                        semibold(11.0),
                         TEXT,
                     );
                     p.text(
-                        pos2(x, c.y + 9.0),
-                        Align2::LEFT_CENTER,
-                        "Free",
-                        small_f,
-                        DIM,
+                        pos2(x1, top + 6.0),
+                        Align2::RIGHT_CENTER,
+                        format!("{} / {}", fmt_gb(d.used_gb), fmt_gb(d.total_gb)),
+                        FontId::proportional(10.0),
+                        MUTED,
                     );
-                    p.text(
-                        pos2(x, c.y + 22.0),
-                        Align2::LEFT_CENTER,
-                        fmt_gb(d.total_gb - d.used_gb),
-                        semibold(12.0),
-                        TEXT,
-                    );
-                }
-                None => {
-                    card_header(&p, r, "Storage", "");
-                    p.text(
-                        r.center(),
-                        Align2::CENTER_CENTER,
-                        "No disk info",
-                        FontId::proportional(11.0),
-                        DIM,
+                    let track = Rect::from_min_size(pos2(x0, top + 15.0), vec2(x1 - x0, 4.0));
+                    p.rect_filled(track, CornerRadius::same(2), TRACK);
+                    p.rect_filled(
+                        Rect::from_min_size(
+                            track.min,
+                            vec2(track.width() * frac.clamp(0.0, 1.0), 4.0),
+                        ),
+                        CornerRadius::same(2),
+                        col,
                     );
                 }
             }
         });
+    }
+
+    fn add_todo(&mut self) -> bool {
+        let text = self.todo_text.trim().to_string();
+        if text.is_empty() {
+            return false;
+        }
+        let due = self.todo_due;
+        {
+            let mut st = self.todos.lock().unwrap();
+            st.next_id += 1;
+            let id = st.next_id;
+            st.items.push(Todo {
+                id,
+                text,
+                done: false,
+                due,
+                notified: false,
+            });
+            save_todos(&st.items);
+            self.added = Some((id, Instant::now()));
+        }
+        self.add_flash = Some(Instant::now());
+        self.todo_text.clear();
+        self.todo_due = None;
+        true
+    }
+
+    fn open_picker(&mut self) {
+        let base = self
+            .todo_due
+            .and_then(|t| Local.timestamp_opt(t, 0).single())
+            .unwrap_or_else(|| Local::now() + chrono::Duration::hours(1));
+        self.pk_date = base.date_naive();
+        self.pk_h = base.hour();
+        self.pk_m = if self.todo_due.is_some() {
+            base.minute()
+        } else {
+            base.minute() / 5 * 5
+        };
+        self.pk_view = (base.year(), base.month());
+        self.picker_open = true;
+    }
+
+    fn pk_ts(&self) -> Option<i64> {
+        let dt = self.pk_date.and_hms_opt(self.pk_h, self.pk_m, 0)?;
+        Local
+            .from_local_datetime(&dt)
+            .earliest()
+            .map(|d| d.timestamp())
+    }
+
+    /// [ task text ........ ] [ date & time ] [ + ]  - same height and radius.
+    fn todo_input_row(&mut self, ui: &mut Ui) {
+        let ctx = ui.ctx().clone();
+        let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), FIELD_H), Sense::hover());
+        let gap = 6.0;
+        let btn = Rect::from_min_size(
+            pos2(row.right() - FIELD_H, row.top()),
+            vec2(FIELD_H, FIELD_H),
+        );
+        let when = Rect::from_min_max(
+            pos2(btn.left() - gap - DUE_W, row.top()),
+            pos2(btn.left() - gap, row.bottom()),
+        );
+        let task = Rect::from_min_max(row.min, pos2(when.left() - gap, row.bottom()));
+
+        // ---- task text ----
+        let task_id = egui::Id::new("todo_text");
+        let focused = ctx.memory(|m| m.has_focus(task_id));
+        let hovered = ui.rect_contains_pointer(task);
+        ui.painter().rect_filled(
+            task,
+            CornerRadius::same(FIELD_R),
+            field_fill(hovered, focused),
+        );
+        if ui
+            .interact(task, egui::Id::new("todo_text_box"), Sense::click())
+            .clicked()
+        {
+            ctx.memory_mut(|m| m.request_focus(task_id));
+        }
+        let inner = task.shrink2(vec2(12.0, 0.0));
+        let r1 = ui
+            .scope_builder(
+                UiBuilder::new()
+                    .max_rect(inner)
+                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.todo_text)
+                            .id(task_id)
+                            .frame(false)
+                            .margin(egui::Margin::ZERO)
+                            .desired_width(inner.width())
+                            .font(FontId::proportional(12.5))
+                            .text_color(TEXT)
+                            .hint_text(RichText::new("Add a task…").color(DIM)),
+                    )
+                },
+            )
+            .inner;
+
+        // ---- date & time button ----
+        let main = ui.interact(when, egui::Id::new("todo_when"), Sense::click());
+        let x_rect =
+            Rect::from_min_size(pos2(when.right() - 26.0, when.top()), vec2(26.0, FIELD_H));
+        let x_resp = if self.todo_due.is_some() {
+            Some(btn_rect(ui, x_rect, "todo_when_clear"))
+        } else {
+            None
+        };
+        let main = main.on_hover_cursor(egui::CursorIcon::PointingHand);
+        ui.painter().rect_filled(
+            when,
+            CornerRadius::same(FIELD_R),
+            field_fill(main.hovered(), false),
+        );
+        // calendar icon
+        {
+            let p = ui.painter();
+            let ic = pos2(when.left() + 16.0, when.center().y);
+            let box_r = Rect::from_center_size(ic, vec2(11.0, 10.0));
+            p.rect_stroke(
+                box_r,
+                CornerRadius::same(2),
+                Stroke::new(1.2, MUTED),
+                StrokeKind::Inside,
+            );
+            p.line_segment(
+                [
+                    pos2(box_r.left(), box_r.top() + 3.0),
+                    pos2(box_r.right(), box_r.top() + 3.0),
+                ],
+                Stroke::new(1.2, MUTED),
+            );
+        }
+        let now_ts = Local::now().timestamp();
+        let (label, col) = match self.todo_due {
+            Some(ts) => (fmt_due(ts), if ts <= now_ts { WARN } else { TEXT }),
+            None => ("Date & time".to_string(), DIM),
+        };
+        ui.painter().text(
+            pos2(when.left() + 30.0, when.center().y),
+            Align2::LEFT_CENTER,
+            label,
+            FontId::proportional(11.5),
+            col,
+        );
+        if let Some(xr) = &x_resp {
+            let c = x_rect.center();
+            let sc = if xr.hovered() { TEXT } else { MUTED };
+            let st = Stroke::new(1.3, sc);
+            let p = ui.painter();
+            p.line_segment([c + vec2(-3.5, -3.5), c + vec2(3.5, 3.5)], st);
+            p.line_segment([c + vec2(-3.5, 3.5), c + vec2(3.5, -3.5)], st);
+        }
+        if x_resp.as_ref().map_or(false, |r| r.clicked()) {
+            self.todo_due = None;
+        } else if main.clicked() {
+            self.open_picker();
+        }
+
+        // ---- add button (flashes green with a check after a successful add) ----
+        let resp = ui.interact(btn, egui::Id::new("todo_add"), Sense::click());
+        let flash = self
+            .add_flash
+            .map(|t| t.elapsed().as_secs_f32())
+            .filter(|e| *e < 0.7);
+        let k = flash.map_or(0.0, |e| 1.0 - e / 0.7);
+        let base = if resp.hovered() { Color32::WHITE } else { TEXT };
+        ui.painter().rect_filled(
+            btn,
+            CornerRadius::same(FIELD_R),
+            base.lerp_to_gamma(GREEN, k),
+        );
+        let c = btn.center();
+        let s = Stroke::new(1.8, BG);
+        if flash.map_or(false, |e| e < 0.45) {
+            ui.painter()
+                .line_segment([c + vec2(-5.0, 0.5), c + vec2(-1.5, 4.0)], s);
+            ui.painter()
+                .line_segment([c + vec2(-1.5, 4.0), c + vec2(5.5, -4.0)], s);
+        } else {
+            ui.painter()
+                .line_segment([c - vec2(5.0, 0.0), c + vec2(5.0, 0.0)], s);
+            ui.painter()
+                .line_segment([c - vec2(0.0, 5.0), c + vec2(0.0, 5.0)], s);
+        }
+        let clicked = resp
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .clicked();
+
+        let enter = r1.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        if clicked || enter {
+            if self.add_todo() {
+                ctx.memory_mut(|m| m.request_focus(task_id));
+            }
+        }
+    }
+
+    /// Inline date + time picker (replaces the task list while open).
+    fn picker_ui(&mut self, ui: &mut Ui) {
+        let now = Local::now();
+        let today = now.date_naive();
+        let (area, _) = ui.allocate_exact_size(vec2(ui.available_width(), 138.0), Sense::hover());
+        let p = ui.painter_at(area);
+        let (cw, ch) = (26.0, 16.0);
+        let cal_w = cw * 7.0;
+        let (year, month) = self.pk_view;
+        let Some(first) = NaiveDate::from_ymd_opt(year, month, 1) else {
+            self.picker_open = false;
+            return;
+        };
+
+        // ---- calendar header ----
+        let hy = area.top() + 10.0;
+        if arrow_btn(
+            ui,
+            &p,
+            Rect::from_center_size(pos2(area.left() + 10.0, hy), vec2(20.0, 20.0)),
+            -1.0,
+            "prev",
+        ) {
+            self.pk_view = if month == 1 {
+                (year - 1, 12)
+            } else {
+                (year, month - 1)
+            };
+        }
+        if arrow_btn(
+            ui,
+            &p,
+            Rect::from_center_size(pos2(area.left() + cal_w - 10.0, hy), vec2(20.0, 20.0)),
+            1.0,
+            "next",
+        ) {
+            self.pk_view = if month == 12 {
+                (year + 1, 1)
+            } else {
+                (year, month + 1)
+            };
+        }
+        p.text(
+            pos2(area.left() + cal_w / 2.0, hy),
+            Align2::CENTER_CENTER,
+            first.format("%B %Y").to_string(),
+            semibold(12.0),
+            TEXT,
+        );
+        for (i, w) in ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]
+            .iter()
+            .enumerate()
+        {
+            p.text(
+                pos2(area.left() + cw * (i as f32 + 0.5), area.top() + 30.0),
+                Align2::CENTER_CENTER,
+                *w,
+                FontId::proportional(10.0),
+                DIM,
+            );
+        }
+
+        // ---- day grid ----
+        let grid_top = area.top() + 40.0;
+        let offset = first.weekday().num_days_from_monday() as usize;
+        for d in 1..=31u32 {
+            let Some(date) = NaiveDate::from_ymd_opt(year, month, d) else {
+                break;
+            };
+            let idx = offset + d as usize - 1;
+            let cell = Rect::from_min_size(
+                pos2(
+                    area.left() + (idx % 7) as f32 * cw,
+                    grid_top + (idx / 7) as f32 * ch,
+                ),
+                vec2(cw, ch),
+            )
+            .shrink2(vec2(1.0, 0.5));
+            let past = date < today;
+            let resp = if past {
+                None
+            } else {
+                Some(btn_rect(ui, cell, ("pk_day", d)))
+            };
+            let hovered = resp.as_ref().map_or(false, |r| r.hovered());
+            let selected = date == self.pk_date;
+            if selected {
+                p.rect_filled(cell, CornerRadius::same(5), TEXT);
+            } else if hovered {
+                p.rect_filled(cell, CornerRadius::same(5), Color32::from_rgb(32, 34, 42));
+            }
+            if date == today && !selected {
+                p.rect_stroke(
+                    cell,
+                    CornerRadius::same(5),
+                    Stroke::new(1.0, ACCENT),
+                    StrokeKind::Inside,
+                );
+            }
+            let col = if selected {
+                BG
+            } else if past {
+                DIM
+            } else {
+                TEXT
+            };
+            p.text(
+                cell.center(),
+                Align2::CENTER_CENTER,
+                d.to_string(),
+                FontId::proportional(11.0),
+                col,
+            );
+            if resp.map_or(false, |r| r.clicked()) {
+                self.pk_date = date;
+            }
+        }
+
+        // ---- right side: time, quick dates, actions ----
+        let rx = area.left() + cal_w + 28.0;
+        p.text(
+            pos2(rx, area.top() + 8.0),
+            Align2::LEFT_CENTER,
+            "Time",
+            FontId::proportional(11.0),
+            MUTED,
+        );
+        stepper(
+            ui,
+            &p,
+            pos2(rx, area.top() + 20.0),
+            &mut self.pk_h,
+            24,
+            1,
+            "h",
+        );
+        p.text(
+            pos2(rx + 96.0 + 8.0, area.top() + 34.0),
+            Align2::CENTER_CENTER,
+            ":",
+            semibold(13.0),
+            DIM,
+        );
+        stepper(
+            ui,
+            &p,
+            pos2(rx + 96.0 + 16.0, area.top() + 20.0),
+            &mut self.pk_m,
+            60,
+            5,
+            "m",
+        );
+
+        let mut quick: Option<NaiveDate> = None;
+        let mut x = rx;
+        for (label, w, days) in [
+            ("Today", 56.0, 0i64),
+            ("Tomorrow", 76.0, 1),
+            ("Next week", 84.0, 7),
+        ] {
+            let r = Rect::from_min_size(pos2(x, area.top() + 58.0), vec2(w, 24.0));
+            if text_btn(ui, &p, r, label, label, false, true) {
+                quick = today.checked_add_signed(chrono::Duration::days(days));
+            }
+            x += w + 6.0;
+        }
+        if let Some(d) = quick {
+            self.pk_date = d;
+            self.pk_view = (d.year(), d.month());
+        }
+
+        // actions
+        let by = area.top() + 104.0;
+        let ts = self.pk_ts();
+        let future = ts.map_or(false, |t| t > now.timestamp());
+        let right = area.right();
+        let done = Rect::from_min_size(pos2(right - 72.0, by), vec2(72.0, 28.0));
+        let clear = Rect::from_min_size(pos2(right - 72.0 - 6.0 - 64.0, by), vec2(64.0, 28.0));
+        let (sum, sum_col) = match ts {
+            Some(t) if future => (fmt_due(t), TEXT),
+            Some(_) => ("Time has passed".to_string(), WARN),
+            None => (String::new(), TEXT),
+        };
+        p.text(
+            pos2(rx, by + 14.0),
+            Align2::LEFT_CENTER,
+            sum,
+            FontId::proportional(11.5),
+            sum_col,
+        );
+        if text_btn(ui, &p, clear, "Clear", "clear", false, true) {
+            self.todo_due = None;
+            self.picker_open = false;
+        }
+        if text_btn(ui, &p, done, "Done", "done", true, future) {
+            self.todo_due = ts;
+            self.picker_open = false;
+        }
+    }
+
+    fn todo_section(&mut self, ui: &mut Ui) {
+        let dt = ui.input(|i| i.stable_dt).min(0.05);
+        let target = if self.picker_open { 1.0 } else { 0.0 };
+        let step = dt / 0.30;
+        if self.pk_anim < target {
+            self.pk_anim = (self.pk_anim + step).min(1.0);
+        } else if self.pk_anim > target {
+            self.pk_anim = (self.pk_anim - step).max(0.0);
+        }
+
+        if self.pk_anim <= 0.0 {
+            self.todo_main(ui);
+        } else if self.pk_anim >= 1.0 {
+            self.picker_ui(ui);
+        } else {
+            // Task list slides out to the left, picker slides in from the right (and back).
+            let rect = ui.available_rect_before_wrap();
+            let e = ease(self.pk_anim);
+            let w = rect.width();
+            let a = self.cur_alpha;
+            let mut c1 = slide_child(ui, rect, -e * w, a * (1.0 - e), "tk_main");
+            self.todo_main(&mut c1);
+            let mut c2 = slide_child(ui, rect, (1.0 - e) * w, a * e, "tk_picker");
+            self.picker_ui(&mut c2);
+            ui.ctx().request_repaint();
+        }
+    }
+
+    fn todo_main(&mut self, ui: &mut Ui) {
+        self.todo_input_row(ui);
+        ui.add_space(6.0);
+
+        // ---- list ----
+        let mut items = self.todos.lock().unwrap().items.clone();
+        items.sort_by_key(|t| (t.done, t.due.unwrap_or(i64::MAX), t.id));
+
+        if items.is_empty() {
+            ui.add_space(14.0);
+            ui.vertical_centered(|ui| {
+                ui.label(
+                    RichText::new("No tasks yet")
+                        .font(semibold(14.0))
+                        .color(TEXT),
+                );
+                ui.add_space(2.0);
+                ui.label(small(
+                    "Pick a date & time to get a reminder (optional)".into(),
+                ));
+            });
+            return;
+        }
+
+        let now = Local::now().timestamp();
+        let added = self.added;
+        let mut toggle: Option<u64> = None;
+        let mut delete: Option<u64> = None;
+
+        egui::ScrollArea::vertical()
+            .max_height(100.0)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
+                for t in &items {
+                    let (alloc, resp) =
+                        ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::click());
+                    // New item: slides in from the right, fades in, and flashes green.
+                    let anim = added
+                        .filter(|(id, at)| *id == t.id && at.elapsed().as_secs_f32() < 0.45)
+                        .map(|(_, at)| at.elapsed().as_secs_f32() / 0.45);
+                    let mut p = ui.painter_at(alloc);
+                    let rect = match anim {
+                        Some(k) => {
+                            let e = ease_out(k);
+                            p.set_opacity(e);
+                            p.rect_filled(
+                                alloc,
+                                CornerRadius::same(FIELD_R),
+                                GREEN.gamma_multiply(0.16 * (1.0 - k)),
+                            );
+                            ui.scroll_to_rect(alloc, None);
+                            alloc.translate(vec2((1.0 - e) * 60.0, 0.0))
+                        }
+                        None => alloc,
+                    };
+                    if resp.hovered() {
+                        p.rect_filled(
+                            rect,
+                            CornerRadius::same(FIELD_R),
+                            Color32::from_rgb(20, 21, 27),
+                        );
+                    }
+                    let cy = rect.center().y;
+                    let cc = pos2(rect.left() + 12.0, cy);
+                    if t.done {
+                        p.circle_filled(cc, 7.0, GREEN);
+                        let s = Stroke::new(1.6, BG);
+                        p.line_segment([cc + vec2(-3.0, 0.0), cc + vec2(-1.0, 2.5)], s);
+                        p.line_segment([cc + vec2(-1.0, 2.5), cc + vec2(3.5, -2.5)], s);
+                    } else {
+                        p.circle_stroke(cc, 7.0, Stroke::new(1.5, DIM));
+                    }
+
+                    let right = rect.right() - 24.0;
+                    let x = rect.left() + 28.0;
+                    let mut text_max = right - x;
+                    if let Some(d) = t.due {
+                        let overdue = !t.done && d <= now;
+                        let label = fmt_due(d);
+                        let f = FontId::proportional(10.5);
+                        let w = text_w(&p, &label, &f);
+                        p.text(
+                            pos2(right, cy),
+                            Align2::RIGHT_CENTER,
+                            label,
+                            f,
+                            if overdue { WARN } else { MUTED },
+                        );
+                        text_max -= w + 10.0;
+                    }
+                    let f = FontId::proportional(12.0);
+                    let (txt, tw) = fit(&p, &one_line(&t.text), f.clone(), text_max.max(30.0));
+                    let col = if t.done { DIM } else { TEXT };
+                    p.text(pos2(x, cy), Align2::LEFT_CENTER, txt, f, col);
+                    if t.done {
+                        p.line_segment([pos2(x, cy), pos2(x + tw, cy)], Stroke::new(1.0, DIM));
+                    }
+
+                    if resp.hovered() {
+                        let c = pos2(rect.right() - 11.0, cy);
+                        let s = Stroke::new(1.3, MUTED);
+                        p.line_segment([c + vec2(-3.5, -3.5), c + vec2(3.5, 3.5)], s);
+                        p.line_segment([c + vec2(-3.5, 3.5), c + vec2(3.5, -3.5)], s);
+                    }
+                    if resp.clicked() {
+                        if let Some(pos) = resp.interact_pointer_pos() {
+                            if pos.x > rect.right() - 24.0 {
+                                delete = Some(t.id);
+                            } else {
+                                toggle = Some(t.id);
+                            }
+                        }
+                    }
+                }
+            });
+
+        if toggle.is_some() || delete.is_some() {
+            let mut st = self.todos.lock().unwrap();
+            if let Some(id) = toggle {
+                if let Some(t) = st.items.iter_mut().find(|t| t.id == id) {
+                    t.done = !t.done;
+                    // re-opened -> reminder is active again if the time is still ahead
+                    t.notified = t.due.map_or(false, |d| d <= now);
+                }
+            }
+            if let Some(id) = delete {
+                st.items.retain(|t| t.id != id);
+            }
+            save_todos(&st.items);
+        }
     }
 }
 
