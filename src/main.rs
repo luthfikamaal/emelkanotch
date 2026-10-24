@@ -932,15 +932,16 @@ fn run_update(
     notifs: Arc<Mutex<NotifState>>,
     ctx: egui::Context,
     manual: bool,
-) {
+) -> bool {
     {
         let mut s = upd.lock().unwrap();
         if matches!(*s, Upd::Checking | Upd::Updating(_)) {
-            return;
+            return false;
         }
         *s = Upd::Checking;
     }
     ctx.request_repaint();
+    let mut check_failed = false;
 
     match check_update() {
         Ok(Some((tag, url))) => {
@@ -964,10 +965,12 @@ fn run_update(
             *upd.lock().unwrap() = if manual { Upd::UpToDate } else { Upd::Idle };
         }
         Err(()) => {
+            check_failed = true;
             *upd.lock().unwrap() = if manual { Upd::Failed } else { Upd::Idle };
         }
     }
     ctx.request_repaint();
+    check_failed
 }
 
 fn spawn_updater(ctx: egui::Context, upd: Arc<Mutex<Upd>>, notifs: Arc<Mutex<NotifState>>) {
@@ -984,8 +987,8 @@ fn spawn_updater(ctx: egui::Context, upd: Arc<Mutex<Upd>>, notifs: Arc<Mutex<Not
             }
         }
         loop {
-            run_update(upd.clone(), notifs.clone(), ctx.clone(), false);
-            thread::sleep(Duration::from_secs(6 * 3600));
+            let failed = run_update(upd.clone(), notifs.clone(), ctx.clone(), false);
+            thread::sleep(Duration::from_secs(if failed { 5 * 60 } else { 6 * 3600 }));
         }
     });
 }
