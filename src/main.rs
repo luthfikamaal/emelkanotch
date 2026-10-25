@@ -40,7 +40,8 @@ const PAD: f32 = 16.0;
 const WIN_W: f32 = PANEL_W + 20.0;
 const WIN_H: f32 = PANEL_H + TOP + 12.0;
 
-const LYRIC_LEAD_MS: u64 = 300;
+// [offset] 1/8: now i64 so per-song / per-app offsets can be added (and be negative)
+const LYRIC_LEAD_MS: i64 = 300;
 const NOTIF_SHOW: Duration = Duration::from_secs(5);
 const UA: &str = "EmelkaNotch/0.3 (personal project)";
 const HIST: usize = 60;
@@ -498,6 +499,66 @@ fn current_line(l: &Lyrics, pos_ms: u64) -> Option<&str> {
         }
     }
     None
+}
+
+// =====================================================================
+// [offset] 2/8: Lyric timing offsets (per song + per app), stored in %APPDATA%
+// =====================================================================
+
+#[derive(Default, Clone)]
+struct Offsets {
+    tracks: HashMap<String, i64>,
+    apps: HashMap<String, i64>,
+}
+
+fn offsets_path() -> Option<PathBuf> {
+    let dir = PathBuf::from(std::env::var_os("APPDATA")?).join("EmelkaNotch");
+    let _ = std::fs::create_dir_all(&dir);
+    Some(dir.join("lyric_offsets.json"))
+}
+
+fn load_offsets() -> Offsets {
+    let mut o = Offsets::default();
+    let Some(p) = offsets_path() else { return o };
+    let Ok(s) = std::fs::read_to_string(p) else {
+        return o;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) else {
+        return o;
+    };
+    for (field, map) in [("tracks", &mut o.tracks), ("apps", &mut o.apps)] {
+        if let Some(obj) = v.get(field).and_then(|x| x.as_object()) {
+            for (k, val) in obj {
+                if let Some(n) = val.as_i64() {
+                    map.insert(k.clone(), n);
+                }
+            }
+        }
+    }
+    o
+}
+
+fn save_offsets(o: &Offsets) {
+    let Some(p) = offsets_path() else { return };
+    let v = serde_json::json!({ "tracks": o.tracks, "apps": o.apps });
+    let _ = std::fs::write(p, v.to_string());
+}
+
+/// Cleaned so "(Official Video)" etc. doesn't create a separate entry.
+fn track_key(m: &Media) -> String {
+    format!(
+        "{}\u{1}{}",
+        clean_artist(&m.artist).to_lowercase(),
+        clean_title(&m.title).to_lowercase()
+    )
+}
+
+fn app_key(m: &Media) -> String {
+    app_label(&m.app).to_lowercase()
+}
+
+fn shift(pos_ms: u64, lead: i64) -> u64 {
+    (pos_ms as i64 + lead).max(0) as u64
 }
 
 // =====================================================================
@@ -1766,6 +1827,13 @@ struct EmelkaNotch {
     cur_alpha: f32,
     added: Option<(u64, Instant)>,
     add_flash: Option<Instant>,
+    notif_clear: Option<Instant>,       // "Clear all" animation start
+    notif_out: Vec<(Instant, Instant)>, // (notification.at, dismiss start)
+
+    // [offset] 3/8: lyric offsets
+    offsets: Offsets,
+    off_app: bool, // false = adjust this song, true = adjust this app
+    off_hold: Option<(u8, Instant, Instant)>, // (button, pressed at, last step)
 }
 
 impl EmelkaNotch {
@@ -1841,6 +1909,12 @@ impl EmelkaNotch {
             cur_alpha: 1.0,
             added: None,
             add_flash: None,
+            notif_clear: None,
+            notif_out: Vec::new(),
+            // [offset] 3/8
+            offsets: load_offsets(),
+            off_app: false,
+            off_hold: None,
         }
     }
 
@@ -1929,16 +2003,18 @@ impl EmelkaNotch {
     }
 
     /// Decide what the pill shows (notification > lyric > title > idle) and measure it.
+    // [offset] 4/8: new `lead` parameter
     fn refresh_view(
         &mut self,
         p: &Painter,
         media: &Media,
         lyrics: &Lyrics,
         pos_ms: u64,
+        lead: i64,
         notif: Option<&Notif>,
     ) {
         let lyric_line = if media.playing {
-            current_line(lyrics, pos_ms + LYRIC_LEAD_MS)
+            current_line(lyrics, shift(pos_ms, lead))
         } else {
             None
         };
@@ -2036,7 +2112,9 @@ impl EmelkaNotch {
             n.latest.clone().filter(|x| x.at.elapsed() < NOTIF_SHOW)
         };
 
-        self.refresh_view(&painter, &media, &lyrics, pos_ms, notif.as_ref());
+        // [offset] 5/8
+        let lead = self.lead_for(&media);
+        self.refresh_view(&painter, &media, &lyrics, pos_ms, lead, notif.as_ref());
 
         // Smoothly follow the target pill size.
         let dt = ui.input(|i| i.stable_dt).min(0.05);
@@ -2098,16 +2176,20 @@ impl EmelkaNotch {
             } else {
                 let time = ui.input(|i| i.time) as f32;
                 let eq_color = if media.available { ACCENT } else { DIM };
+                let ppp = ui.ctx().pixels_per_point();
+                let bw = (3.0 * ppp).round().max(1.0);
+                let gp = (2.0 * ppp).round().max(1.0);
+                let x0 = ((rect.left() + 20.0) * ppp).round();
                 for i in 0..3 {
                     let h = if media.playing {
                         4.0 + 9.0 * ((time * 7.0 + i as f32 * 1.7).sin() * 0.5 + 0.5)
                     } else {
                         4.0
                     };
-                    let r = Rect::from_center_size(
-                        pos2(rect.left() + 20.0 + i as f32 * 5.0, c.y),
-                        vec2(3.0, h),
-                    );
+                    let hp = ((h * ppp / 2.0).round() * 2.0).max(2.0);
+                    let left = (x0 + i as f32 * (bw + gp)) / ppp;
+                    let top = (c.y * ppp - hp / 2.0).round() / ppp;
+                    let r = Rect::from_min_size(pos2(left, top), vec2(bw / ppp, hp / ppp));
                     p.rect_filled(
                         r,
                         CornerRadius::same(1),
@@ -2255,15 +2337,18 @@ impl EmelkaNotch {
     }
 
     fn alerts_section(&mut self, ui: &mut Ui) {
-        let (items, err) = {
+        let (items, total, err) = {
             let n = self.notifs.lock().unwrap();
             (
                 n.items.iter().take(3).cloned().collect::<Vec<_>>(),
+                n.items.len(),
                 n.error.clone(),
             )
         };
 
         if items.is_empty() {
+            self.notif_clear = None;
+            self.notif_out.clear();
             ui.add_space(26.0);
             ui.vertical_centered(|ui| {
                 ui.label(
@@ -2279,51 +2364,345 @@ impl EmelkaNotch {
             return;
         }
 
+        const DUR: f32 = 0.25; // slide-out duration
+        const STAGGER: f32 = 0.06; // delay between rows on "Clear all"
+        let mut start_all = false;
+        let mut start_one: Option<Instant> = None;
+
+        // ---- header: count + "Clear all" ----
+        let (head, _) = ui.allocate_exact_size(vec2(ui.available_width(), 20.0), Sense::hover());
+        ui.painter().text(
+            pos2(head.left() + 4.0, head.center().y),
+            Align2::LEFT_CENTER,
+            format!("{total} notification{}", if total == 1 { "" } else { "s" }),
+            FontId::proportional(10.5),
+            DIM,
+        );
+        let label = "Clear all";
+        let gw = text_w(ui.painter(), label, &FontId::proportional(10.5));
+        let btn = Rect::from_min_size(
+            pos2(head.right() - gw - 16.0, head.top()),
+            vec2(gw + 16.0, 20.0),
+        );
+        let r = btn_rect(ui, btn, "notif_clear_all");
+        if r.hovered() {
+            ui.painter()
+                .rect_filled(btn, CornerRadius::same(6), Color32::from_rgb(24, 25, 31));
+        }
+        ui.painter().text(
+            btn.center(),
+            Align2::CENTER_CENTER,
+            label,
+            FontId::proportional(10.5),
+            if r.hovered() { TEXT } else { MUTED },
+        );
+        if r.clicked() && self.notif_clear.is_none() {
+            start_all = true;
+        }
+
+        // ---- items: hover shows an x; removed rows slide right, fade, then collapse ----
+        let anim_all = self.notif_clear.map(|t| t.elapsed().as_secs_f32());
+        let mut animating = anim_all.is_some() || !self.notif_out.is_empty();
         ui.spacing_mut().item_spacing.y = 2.0;
-        for n in &items {
-            let (rect, _) =
-                ui.allocate_exact_size(vec2(ui.available_width(), 40.0), Sense::hover());
+        for (i, n) in items.iter().enumerate() {
+            let k = if let Some(el) = anim_all {
+                Some(((el - i as f32 * STAGGER) / DUR).clamp(0.0, 1.0))
+            } else {
+                self.notif_out
+                    .iter()
+                    .find(|(at, _)| *at == n.at)
+                    .map(|(_, st)| (st.elapsed().as_secs_f32() / DUR).clamp(0.0, 1.0))
+            };
+            let exiting = k.is_some();
+            let k = k.unwrap_or(0.0);
+            let collapse = ease(((k - 0.6) / 0.4).clamp(0.0, 1.0));
+            let h = 36.0 * (1.0 - collapse);
+            if h < 0.5 {
+                continue;
+            }
+            let w = ui.available_width();
+            let (rect, resp) = ui.allocate_exact_size(
+                vec2(w, h),
+                if exiting {
+                    Sense::hover()
+                } else {
+                    Sense::click()
+                },
+            );
+            let full = Rect::from_min_size(rect.min, vec2(w, 36.0))
+                .translate(vec2(ease_out(k) * w * 0.6, 0.0));
             let tex = self.icon_tex(ui.ctx(), &n.app_id, &n.icon);
-            let p = ui.painter_at(rect);
+            let mut p = ui.painter_at(rect);
+            if exiting {
+                p.set_opacity(1.0 - k);
+            }
+            let hovered = resp.hovered() && !exiting;
+            if hovered {
+                p.rect_filled(full, CornerRadius::same(8), Color32::from_rgb(16, 17, 22));
+            }
             app_icon(
                 &p,
-                pos2(rect.left() + 14.0, rect.center().y),
-                12.0,
+                pos2(full.left() + 16.0, full.center().y),
+                11.0,
                 tex.as_ref(),
                 &n.app,
                 1.0,
             );
 
-            let max = rect.width() - 36.0 - 48.0;
+            let max = w - 40.0 - 48.0;
             let title_src = if n.title.is_empty() { &n.app } else { &n.title };
             let (title, _) = fit(&p, &one_line(title_src), semibold(12.0), max);
             let (body, _) = fit(&p, &one_line(&n.body), FontId::proportional(11.0), max);
 
             p.text(
-                pos2(rect.left() + 36.0, rect.top() + 12.0),
+                pos2(full.left() + 38.0, full.top() + 11.0),
                 Align2::LEFT_CENTER,
                 title,
                 semibold(12.0),
                 TEXT,
             );
             p.text(
-                pos2(rect.left() + 36.0, rect.top() + 28.0),
+                pos2(full.left() + 38.0, full.top() + 26.0),
                 Align2::LEFT_CENTER,
                 body,
                 FontId::proportional(11.0),
                 MUTED,
             );
-            p.text(
-                pos2(rect.right(), rect.top() + 12.0),
-                Align2::RIGHT_CENTER,
-                ago(n.at),
-                FontId::proportional(10.0),
-                DIM,
-            );
+            if hovered {
+                let c = pos2(full.right() - 14.0, full.center().y);
+                let st = Stroke::new(1.3, MUTED);
+                p.line_segment([c + vec2(-3.5, -3.5), c + vec2(3.5, 3.5)], st);
+                p.line_segment([c + vec2(-3.5, 3.5), c + vec2(3.5, -3.5)], st);
+                if resp.clicked() {
+                    start_one = Some(n.at);
+                }
+                resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+            } else {
+                p.text(
+                    pos2(full.right() - 8.0, full.center().y),
+                    Align2::RIGHT_CENTER,
+                    ago(n.at),
+                    FontId::proportional(10.0),
+                    DIM,
+                );
+            }
+        }
+
+        if start_all {
+            self.notif_clear = Some(Instant::now());
+        }
+        if let Some(at) = start_one {
+            if !self.notif_out.iter().any(|(a, _)| *a == at) {
+                self.notif_out.push((at, Instant::now()));
+            }
+        }
+
+        // ---- finish: actually remove once the animation is done ----
+        let all_done = anim_all.map_or(false, |el| {
+            el >= DUR + STAGGER * items.len().saturating_sub(1) as f32 + 0.02
+        });
+        let done: Vec<Instant> = self
+            .notif_out
+            .iter()
+            .filter(|(_, st)| st.elapsed().as_secs_f32() >= DUR)
+            .map(|(a, _)| *a)
+            .collect();
+        if all_done || !done.is_empty() {
+            let mut st = self.notifs.lock().unwrap();
+            if all_done {
+                st.items.clear();
+                st.latest = None;
+                self.notif_clear = None;
+                self.notif_out.clear();
+            } else {
+                st.items.retain(|n| !done.contains(&n.at));
+                self.notif_out.retain(|(a, _)| !done.contains(a));
+            }
+        }
+        if animating || start_all || start_one.is_some() {
+            animating = true;
+        }
+        if animating {
+            ui.ctx().request_repaint();
         }
     }
 
-    fn media_section(&self, ui: &mut Ui, media: &Media, pos_ms: u64, lyrics: &Lyrics) {
+    // [offset] 6/8: helpers for the offset control
+    fn lead_for(&self, media: &Media) -> i64 {
+        let t = self
+            .offsets
+            .tracks
+            .get(&track_key(media))
+            .copied()
+            .unwrap_or(0);
+        let a = self.offsets.apps.get(&app_key(media)).copied().unwrap_or(0);
+        LYRIC_LEAD_MS + a + t
+    }
+
+    fn scope_offset(&self, media: &Media) -> i64 {
+        if self.off_app {
+            self.offsets.apps.get(&app_key(media)).copied().unwrap_or(0)
+        } else {
+            self.offsets
+                .tracks
+                .get(&track_key(media))
+                .copied()
+                .unwrap_or(0)
+        }
+    }
+
+    /// Appears over the lyrics area while hovering it.
+    fn offset_control(&mut self, ui: &mut Ui, area: Rect, media: &Media) {
+        let hover = ui.rect_contains_pointer(area);
+        let a = ui
+            .ctx()
+            .animate_bool_with_time(egui::Id::new("off_ctl"), hover, 0.15);
+        if a <= 0.01 {
+            return;
+        }
+        let mut p = ui.painter_at(area);
+        p.set_opacity(a);
+
+        let scope_label = if self.off_app {
+            ellipsize(&app_label(&media.app), 10)
+        } else {
+            "Song".to_string()
+        };
+        let (pad, gap, btn_w, val_w, h) = (4.0, 2.0, 22.0, 46.0, 24.0);
+        let chip_w = text_w(&p, &scope_label, &semibold(10.5)) + 16.0;
+        let total = pad * 2.0 + chip_w + gap * 3.0 + btn_w * 2.0 + val_w;
+        let r = Rect::from_min_size(
+            pos2(area.right() - total, area.center().y - h / 2.0),
+            vec2(total, h),
+        );
+        p.rect_filled(r, CornerRadius::same(8), CARD);
+        p.rect_stroke(
+            r,
+            CornerRadius::same(8),
+            Stroke::new(1.0, BORDER),
+            StrokeKind::Inside,
+        );
+
+        let (y, hh) = (r.top() + 2.0, h - 4.0);
+        let chip = Rect::from_min_size(pos2(r.left() + pad, y), vec2(chip_w, hh));
+        let minus = Rect::from_min_size(pos2(chip.right() + gap, y), vec2(btn_w, hh));
+        let val = Rect::from_min_size(pos2(minus.right() + gap, y), vec2(val_w, hh));
+        let plus = Rect::from_min_size(pos2(val.right() + gap, y), vec2(btn_w, hh));
+
+        let r_chip = btn_rect(ui, chip, "off_scope");
+        let r_minus = btn_rect(ui, minus, "off_minus");
+        let r_val = btn_rect(ui, val, "off_val");
+        let r_plus = btn_rect(ui, plus, "off_plus");
+
+        let hl = Color32::from_rgb(32, 34, 42);
+        for (rc, rr) in [
+            (chip, &r_chip),
+            (minus, &r_minus),
+            (val, &r_val),
+            (plus, &r_plus),
+        ] {
+            if rr.hovered() {
+                p.rect_filled(rc, CornerRadius::same(6), hl);
+            }
+        }
+
+        p.text(
+            chip.center(),
+            Align2::CENTER_CENTER,
+            &scope_label,
+            semibold(10.5),
+            if self.off_app { ACCENT } else { TEXT },
+        );
+
+        let st = Stroke::new(1.4, if r_minus.hovered() { TEXT } else { MUTED });
+        let mc = minus.center();
+        p.line_segment([mc - vec2(4.0, 0.0), mc + vec2(4.0, 0.0)], st);
+
+        let st = Stroke::new(1.4, if r_plus.hovered() { TEXT } else { MUTED });
+        let pc = plus.center();
+        p.line_segment([pc - vec2(4.0, 0.0), pc + vec2(4.0, 0.0)], st);
+        p.line_segment([pc - vec2(0.0, 4.0), pc + vec2(0.0, 4.0)], st);
+
+        let cur = self.scope_offset(media);
+        let vlabel = if cur == 0 {
+            "0.0s".to_string()
+        } else {
+            format!("{:+.1}s", cur as f32 / 1000.0)
+        };
+        p.text(
+            val.center(),
+            Align2::CENTER_CENTER,
+            vlabel,
+            FontId::proportional(11.0),
+            if cur != 0 { TEXT } else { MUTED },
+        );
+
+        let mut delta = 0i64;
+        let mut reset = false;
+        if r_chip.clicked() {
+            self.off_app = !self.off_app;
+        }
+        if r_val.clicked() && cur != 0 {
+            reset = true;
+        }
+
+        // Press-and-hold on - / + (accelerates the longer it's held)
+        let held: Option<(u8, i64)> = if r_minus.is_pointer_button_down_on() {
+            Some((1, -1))
+        } else if r_plus.is_pointer_button_down_on() {
+            Some((2, 1))
+        } else {
+            None
+        };
+        match held {
+            Some((id, sign)) => {
+                let now = Instant::now();
+                match self.off_hold {
+                    Some((hid, start, last)) if hid == id => {
+                        let t = start.elapsed().as_secs_f32();
+                        if t > 0.4 {
+                            let (every, step) = if t > 1.5 { (0.10, 500) } else { (0.06, 100) };
+                            if last.elapsed().as_secs_f32() >= every {
+                                delta = sign * step;
+                                self.off_hold = Some((id, start, now));
+                            }
+                        }
+                    }
+                    _ => {
+                        delta = sign * 100; // first press
+                        self.off_hold = Some((id, now, now));
+                    }
+                }
+                ui.ctx().request_repaint();
+            }
+            None => self.off_hold = None,
+        }
+
+        if delta != 0 || reset {
+            let key = if self.off_app {
+                app_key(media)
+            } else {
+                track_key(media)
+            };
+            let map = if self.off_app {
+                &mut self.offsets.apps
+            } else {
+                &mut self.offsets.tracks
+            };
+            let e = map.entry(key).or_insert(0);
+            *e = if reset {
+                0
+            } else {
+                (*e + delta).clamp(-15_000, 15_000)
+            };
+            self.offsets.apps.retain(|_, v| *v != 0);
+            self.offsets.tracks.retain(|_, v| *v != 0);
+            save_offsets(&self.offsets);
+        }
+    }
+
+    // [offset] 7/8: now `&mut self`
+    fn media_section(&mut self, ui: &mut Ui, media: &Media, pos_ms: u64, lyrics: &Lyrics) {
         if !media.available {
             ui.add_space(26.0);
             ui.vertical_centered(|ui| {
@@ -2404,15 +2783,18 @@ impl EmelkaNotch {
 
         ui.add_space(6.0);
         let (area, _) = ui.allocate_exact_size(vec2(ui.available_width(), 54.0), Sense::hover());
-        Self::draw_lyrics(ui, area, lyrics, pos_ms);
+        let lead = self.lead_for(media);
+        Self::draw_lyrics(ui, area, lyrics, shift(pos_ms, lead));
+        self.offset_control(ui, area, media);
     }
 
+    // [offset] 8/8: `pos_ms` already includes the lead/offset
     fn draw_lyrics(ui: &Ui, area: Rect, lyrics: &Lyrics, pos_ms: u64) {
         let painter = ui.painter_at(area);
         let center = area.center();
         match lyrics {
             Lyrics::Synced(lines) => {
-                let pos = pos_ms + LYRIC_LEAD_MS;
+                let pos = pos_ms;
                 let idx = lines.partition_point(|(t, _)| *t <= pos) as f32 - 1.0;
                 let anim = ui
                     .ctx()
