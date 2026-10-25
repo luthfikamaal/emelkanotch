@@ -43,7 +43,7 @@ const WIN_H: f32 = PANEL_H + TOP + 12.0;
 // [offset] 1/8: now i64 so per-song / per-app offsets can be added (and be negative)
 const LYRIC_LEAD_MS: i64 = 300;
 const NOTIF_SHOW: Duration = Duration::from_secs(5);
-const UA: &str = "EmelkaNotch/0.3 (personal project)";
+const UA: &str = "EmelkaNotch/0.5 (personal project)";
 const HIST: usize = 60;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const REPO: &str = "luthfikamaal/emelkanotch";
@@ -961,29 +961,108 @@ fn check_update() -> Result<Option<(String, String)>, ()> {
     }
 }
 
-fn apply_update(url: &str, tag: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let exe = std::env::current_exe()?;
+/// Best-effort log so update failures aren't silent (%APPDATA%\EmelkaNotch\update.log).
+fn log_update_error(msg: &str) {
+    let dir = std::env::var("APPDATA")
+        .map(|d| std::path::PathBuf::from(d).join("EmelkaNotch"))
+        .unwrap_or_else(|_| std::env::temp_dir());
+    let _ = std::fs::create_dir_all(&dir);
+    let line = format!(
+        "[{}] {}\n",
+        chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+        msg
+    );
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("update.log"))
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
+/// Rename with retries — on Windows, AV/Defender often holds the just-downloaded
+/// exe briefly (real-time scan), causing a sharing violation on the first try.
+fn rename_retry(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    let mut last = None;
+    for i in 0..10 {
+        match std::fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last = Some(e);
+                thread::sleep(Duration::from_millis(300 * (i as u64 + 1)));
+            }
+        }
+    }
+    Err(last.unwrap())
+}
+
+fn apply_update(url: &str, tag: &str) -> Result<(), String> {
+    let fail = |e: String| {
+        log_update_error(&format!("apply_update({tag}): {e}"));
+        Err(e)
+    };
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => return fail(format!("current_exe: {e}")),
+    };
     let new = exe.with_extension("new");
     let old = exe.with_extension("old");
 
-    let mut reader = ureq::get(url)
+    let resp = match ureq::get(url)
         .set("User-Agent", UA)
-        .timeout(Duration::from_secs(120))
-        .call()?
-        .into_reader();
-    let mut f = std::fs::File::create(&new)?;
-    std::io::copy(&mut reader, &mut f)?;
+        .timeout(Duration::from_secs(300))
+        .call()
+    {
+        Ok(r) => r,
+        Err(e) => return fail(format!("download: {e}")),
+    };
+    let expected = resp
+        .header("Content-Length")
+        .and_then(|l| l.parse::<u64>().ok());
+    let mut reader = resp.into_reader();
+    let mut f = match std::fs::File::create(&new) {
+        Ok(f) => f,
+        Err(e) => return fail(format!("create {}: {e}", new.display())),
+    };
+    if let Err(e) = std::io::copy(&mut reader, &mut f) {
+        let _ = std::fs::remove_file(&new);
+        return fail(format!("write: {e}"));
+    }
     drop(f);
+    // Sanity check: must be a PE (MZ) and match Content-Length.
+    let size = match std::fs::metadata(&new) {
+        Ok(m) => m.len(),
+        Err(e) => return fail(format!("metadata: {e}")),
+    };
+    if let Some(exp) = expected {
+        if size != exp {
+            let _ = std::fs::remove_file(&new);
+            return fail(format!("size mismatch: got {size}, expected {exp}"));
+        }
+    }
+    match std::fs::read(&new) {
+        Ok(b) if b.len() >= 2 && &b[..2] == b"MZ" => {}
+        _ => {
+            let _ = std::fs::remove_file(&new);
+            return fail("downloaded file is not a valid exe (missing MZ header)".into());
+        }
+    }
 
     let _ = std::fs::remove_file(&old);
-    std::fs::rename(&exe, &old)?;
-    if let Err(e) = std::fs::rename(&new, &exe) {
+    if let Err(e) = rename_retry(&exe, &old) {
+        return fail(format!("rename exe->old: {e}"));
+    }
+    if let Err(e) = rename_retry(&new, &exe) {
         let _ = std::fs::rename(&old, &exe); // rollback
-        return Err(e.into());
+        return fail(format!("rename new->exe: {e}"));
     }
     // The new instance reads this on startup and shows "EmelkaNotch updated".
     let _ = std::fs::write(exe.with_extension("updated"), tag);
-    std::process::Command::new(&exe).spawn()?;
+    if let Err(e) = std::process::Command::new(&exe).spawn() {
+        return fail(format!("restart: {e}"));
+    }
     std::process::exit(0);
 }
 
@@ -1019,12 +1098,12 @@ fn run_update(
                 format!("Downloading {tag}…"),
             );
             ctx.request_repaint();
-            if apply_update(&url, &tag).is_err() {
+            if let Err(e) = apply_update(&url, &tag) {
                 *upd.lock().unwrap() = Upd::Failed;
                 push_notice(
                     &notifs,
                     "Update failed",
-                    "Couldn't install the update.".into(),
+                    format!("Couldn't install the update. {e}"),
                 );
             }
         }
