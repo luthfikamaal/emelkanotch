@@ -7,6 +7,7 @@ use eframe::egui::{
 };
 use rusqlite::{types::ValueRef, Connection};
 use std::collections::{HashMap, VecDeque};
+use std::f32::consts::PI;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -22,7 +23,11 @@ use windows::Win32::Graphics::Gdi::{
     CreateCompatibleDC, DeleteDC, DeleteObject, GetDIBits, GetObjectW, BITMAP, BITMAPINFO,
     BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HGDIOBJ,
 };
-use windows::Win32::System::Com::{CoInitializeEx, IBindCtx, COINIT_APARTMENTTHREADED};
+use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
+use windows::Win32::Media::Audio::{eConsole, eRender, IMMDeviceEnumerator, MMDeviceEnumerator};
+use windows::Win32::System::Com::{
+    CoCreateInstance, CoInitializeEx, IBindCtx, CLSCTX_ALL, COINIT_APARTMENTTHREADED,
+};
 use windows::Win32::UI::Shell::{
     IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_BIGGERSIZEOK, SIIGBF_ICONONLY,
 };
@@ -43,6 +48,7 @@ const WIN_H: f32 = PANEL_H + TOP + 12.0;
 // [offset] 1/8: now i64 so per-song / per-app offsets can be added (and be negative)
 const LYRIC_LEAD_MS: i64 = 300;
 const NOTIF_SHOW: Duration = Duration::from_secs(5);
+const OSD_SHOW: Duration = Duration::from_millis(1600);
 const UA: &str = "EmelkaNotch/0.5 (personal project)";
 const HIST: usize = 60;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -559,6 +565,184 @@ fn app_key(m: &Media) -> String {
 
 fn shift(pos_ms: u64, lead: i64) -> u64 {
     (pos_ms as i64 + lead).max(0) as u64
+}
+
+// =====================================================================
+// Settings (appearance), stored in %APPDATA%\EmelkaNotch\settings.json
+// =====================================================================
+
+/// Floating = pill floating below the top edge. Attached = glued to the top edge of the screen.
+#[derive(Clone, Copy, PartialEq)]
+enum NotchStyle {
+    Floating,
+    Attached,
+}
+
+fn settings_path() -> Option<PathBuf> {
+    let dir = PathBuf::from(std::env::var_os("APPDATA")?).join("EmelkaNotch");
+    let _ = std::fs::create_dir_all(&dir);
+    Some(dir.join("settings.json"))
+}
+
+/// (style, osd_enabled). Missing / broken file -> defaults.
+fn load_settings() -> (NotchStyle, bool) {
+    let mut style = NotchStyle::Floating;
+    let mut osd = true;
+    let Some(p) = settings_path() else {
+        return (style, osd);
+    };
+    let Ok(s) = std::fs::read_to_string(p) else {
+        return (style, osd);
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) else {
+        return (style, osd);
+    };
+    if v.get("style").and_then(|x| x.as_str()) == Some("attached") {
+        style = NotchStyle::Attached;
+    }
+    if let Some(b) = v.get("osd").and_then(|x| x.as_bool()) {
+        osd = b;
+    }
+    (style, osd)
+}
+
+fn save_settings(style: NotchStyle, osd: bool) {
+    let Some(p) = settings_path() else { return };
+    let name = if style == NotchStyle::Attached {
+        "attached"
+    } else {
+        "floating"
+    };
+    let _ = std::fs::write(
+        p,
+        serde_json::json!({ "style": name, "osd": osd }).to_string(),
+    );
+}
+
+// =====================================================================
+// OSD: volume + brightness shown in the pill
+// =====================================================================
+
+#[derive(Clone, Copy, PartialEq)]
+enum OsdKind {
+    Volume,
+    Brightness,
+}
+
+#[derive(Clone, Copy)]
+struct OsdEvent {
+    kind: OsdKind,
+    value: f32, // 0..1
+    muted: bool,
+    at: Instant,
+}
+
+#[derive(Default)]
+struct OsdState {
+    latest: Option<OsdEvent>,
+}
+
+fn push_osd(state: &Arc<Mutex<OsdState>>, kind: OsdKind, value: f32, muted: bool) {
+    state.lock().unwrap().latest = Some(OsdEvent {
+        kind,
+        value,
+        muted,
+        at: Instant::now(),
+    });
+}
+
+/// Polls the default output device's master volume + mute state.
+fn spawn_volume_worker(ctx: egui::Context, state: Arc<Mutex<OsdState>>) {
+    thread::spawn(move || unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let enumerator: IMMDeviceEnumerator =
+            match CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) {
+                Ok(e) => e,
+                Err(_) => return,
+            };
+
+        let mut last: Option<(f32, bool)> = None;
+        loop {
+            thread::sleep(Duration::from_millis(120));
+
+            // Re-fetch the default endpoint every time so switching output devices just works.
+            let cur = (|| -> Option<(f32, bool)> {
+                let dev = enumerator.GetDefaultAudioEndpoint(eRender, eConsole).ok()?;
+                let vol: IAudioEndpointVolume = dev.Activate(CLSCTX_ALL, None).ok()?;
+                let level = vol.GetMasterVolumeLevelScalar().ok()?;
+                let muted = vol.GetMute().ok()?.as_bool();
+                Some((level, muted))
+            })();
+            let Some(cur) = cur else { continue };
+
+            // The first reading is only a baseline (no OSD on startup).
+            if let Some(prev) = last {
+                if (prev.0 - cur.0).abs() >= 0.004 || prev.1 != cur.1 {
+                    push_osd(&state, OsdKind::Volume, cur.0, cur.1);
+                    ctx.request_repaint();
+                }
+            }
+            last = Some(cur);
+        }
+    });
+}
+
+/// Laptop panels: reads WmiMonitorBrightness through one long-lived hidden PowerShell.
+/// On PCs / external monitors it simply prints nothing and the OSD never fires.
+fn spawn_brightness_worker(ctx: egui::Context, state: Arc<Mutex<OsdState>>) {
+    thread::spawn(move || {
+        use std::io::{BufRead, BufReader};
+        use std::os::windows::process::CommandExt;
+        use std::process::{Command, Stdio};
+
+        // Exits by itself when EmelkaNotch is gone, so it never lingers after a crash/update.
+        let script = format!(
+            "$p={}; while($true){{ \
+               if(-not (Get-Process -Id $p -ErrorAction SilentlyContinue)){{ exit }}; \
+               try{{ \
+                 $b=(Get-CimInstance -Namespace root/WMI -ClassName WmiMonitorBrightness -ErrorAction Stop | Select-Object -First 1).CurrentBrightness; \
+                 [Console]::Out.WriteLine($b); [Console]::Out.Flush() \
+               }}catch{{}}; \
+               Start-Sleep -Milliseconds 400 \
+             }}",
+            std::process::id()
+        );
+
+        let Ok(mut child) = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-WindowStyle",
+                "Hidden",
+                "-Command",
+                &script,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+            .spawn()
+        else {
+            return;
+        };
+        let Some(out) = child.stdout.take() else {
+            return;
+        };
+
+        let mut last: Option<u32> = None;
+        for line in BufReader::new(out).lines().map_while(Result::ok) {
+            let Ok(v) = line.trim().parse::<u32>() else {
+                continue;
+            };
+            if let Some(prev) = last {
+                if prev != v {
+                    push_osd(&state, OsdKind::Brightness, v as f32 / 100.0, false);
+                    ctx.request_repaint();
+                }
+            }
+            last = Some(v);
+        }
+    });
 }
 
 // =====================================================================
@@ -1527,10 +1711,10 @@ fn setup_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
-fn shape_rect(pw: f32, ph: f32, e: f32) -> Rect {
+fn shape_rect(pw: f32, ph: f32, e: f32, top: f32) -> Rect {
     let w = lerp(pw, PANEL_W, e);
     let h = lerp(ph, PANEL_H, e);
-    Rect::from_min_size(pos2((WIN_W - w) / 2.0, TOP), vec2(w, h))
+    Rect::from_min_size(pos2((WIN_W - w) / 2.0, top), vec2(w, h))
 }
 
 /// Cursor position in the window's local point space (works even when unfocused).
@@ -1597,23 +1781,143 @@ fn app_icon(
     }
 }
 
-fn tab(ui: &mut Ui, label: &str, selected: bool) -> bool {
-    let color = if selected { TEXT } else { MUTED };
-    let galley = ui
-        .painter()
-        .layout_no_wrap(label.to_owned(), FontId::proportional(12.0), color);
-    let (rect, resp) = ui.allocate_exact_size(galley.size() + vec2(22.0, 10.0), Sense::click());
+/// Speaker (with waves, or an X when muted) / sun icon for the OSD.
+fn osd_icon(p: &Painter, c: Pos2, kind: OsdKind, muted: bool, col: Color32) {
+    let st = Stroke::new(1.4, col);
+    match kind {
+        OsdKind::Volume => {
+            p.rect_filled(
+                Rect::from_min_max(pos2(c.x - 7.0, c.y - 2.2), pos2(c.x - 3.5, c.y + 2.2)),
+                CornerRadius::same(1),
+                col,
+            );
+            p.add(Shape::convex_polygon(
+                vec![
+                    pos2(c.x - 3.5, c.y - 2.2),
+                    pos2(c.x + 0.5, c.y - 5.5),
+                    pos2(c.x + 0.5, c.y + 5.5),
+                    pos2(c.x - 3.5, c.y + 2.2),
+                ],
+                col,
+                Stroke::NONE,
+            ));
+            if muted {
+                p.line_segment([c + vec2(3.0, -3.0), c + vec2(8.0, 3.0)], st);
+                p.line_segment([c + vec2(3.0, 3.0), c + vec2(8.0, -3.0)], st);
+            } else {
+                for r in [3.5f32, 6.5] {
+                    let pts: Vec<Pos2> = (0..=8)
+                        .map(|i| {
+                            let a = -0.75 + 1.5 * i as f32 / 8.0;
+                            pos2(c.x + 0.5 + r * a.cos(), c.y + r * a.sin())
+                        })
+                        .collect();
+                    p.add(Shape::line(pts, st));
+                }
+            }
+        }
+        OsdKind::Brightness => {
+            p.circle_stroke(c, 3.2, st);
+            for k in 0..8 {
+                let a = k as f32 * PI / 4.0;
+                let (s, co) = a.sin_cos();
+                p.line_segment(
+                    [c + vec2(co * 5.6, s * 5.6), c + vec2(co * 8.0, s * 8.0)],
+                    Stroke::new(1.3, col),
+                );
+            }
+        }
+    }
+}
+
+/// Tab berbentuk ikon; nama tampil sebagai tooltip saat di-hover.
+fn tab_icon(ui: &mut Ui, sec: Section, label: &str, selected: bool) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(vec2(32.0, 28.0), Sense::click());
+    let hov = resp.hovered();
     let bg = if selected {
         Color32::from_rgb(40, 42, 52)
-    } else if resp.hovered() {
+    } else if hov {
         Color32::from_rgb(24, 25, 31)
     } else {
         Color32::TRANSPARENT
     };
-    ui.painter().rect_filled(rect, CornerRadius::same(8), bg);
-    ui.painter()
-        .galley(rect.center() - galley.size() / 2.0, galley, color);
+    let col = if selected {
+        TEXT
+    } else if hov {
+        Color32::from_rgb(190, 194, 205)
+    } else {
+        MUTED
+    };
+    let p = ui.painter();
+    p.rect_filled(rect, CornerRadius::same(8), bg);
+    let c = rect.center();
+    let st = Stroke::new(1.4, col);
+
+    match sec {
+        Section::Media => {
+            // not musik
+            p.circle_filled(c + vec2(-2.5, 4.0), 2.8, col);
+            p.line_segment([c + vec2(0.2, 3.5), c + vec2(0.2, -5.5)], st);
+            p.line_segment([c + vec2(0.2, -5.5), c + vec2(4.5, -3.0)], st);
+        }
+        Section::Alerts => {
+            // lonceng
+            let r = 4.5;
+            let mut pts: Vec<Pos2> = (0..=12)
+                .map(|i| {
+                    let a = PI + PI * i as f32 / 12.0;
+                    pos2(c.x + r * a.cos(), c.y - 1.0 + r * a.sin())
+                })
+                .collect();
+            pts.push(pos2(c.x + 5.5, c.y + 3.5));
+            pts.push(pos2(c.x - 5.5, c.y + 3.5));
+            p.add(Shape::closed_line(pts, st));
+            p.circle_filled(c + vec2(0.0, 6.0), 1.3, col);
+        }
+        Section::System => {
+            // chip
+            p.rect_stroke(
+                Rect::from_center_size(c, vec2(11.0, 11.0)),
+                CornerRadius::same(2),
+                st,
+                StrokeKind::Inside,
+            );
+            p.rect_stroke(
+                Rect::from_center_size(c, vec2(5.0, 5.0)),
+                CornerRadius::same(1),
+                Stroke::new(1.2, col),
+                StrokeKind::Inside,
+            );
+            for o in [-2.5f32, 2.5] {
+                p.line_segment([pos2(c.x + o, c.y - 5.5), pos2(c.x + o, c.y - 8.0)], st);
+                p.line_segment([pos2(c.x + o, c.y + 5.5), pos2(c.x + o, c.y + 8.0)], st);
+                p.line_segment([pos2(c.x - 5.5, c.y + o), pos2(c.x - 8.0, c.y + o)], st);
+                p.line_segment([pos2(c.x + 5.5, c.y + o), pos2(c.x + 8.0, c.y + o)], st);
+            }
+        }
+        Section::Todo => {
+            // lingkaran + centang
+            p.circle_stroke(c, 6.5, st);
+            p.line_segment([c + vec2(-3.0, 0.2), c + vec2(-0.8, 2.6)], st);
+            p.line_segment([c + vec2(-0.8, 2.6), c + vec2(3.2, -2.4)], st);
+        }
+        Section::Settings => {
+            // gear
+            p.circle_stroke(c, 4.0, st);
+            p.circle_filled(c, 1.4, col);
+            for k in 0..8 {
+                let a = k as f32 * PI / 4.0;
+                let (s, co) = a.sin_cos();
+                p.line_segment(
+                    [c + vec2(co * 4.6, s * 4.6), c + vec2(co * 6.8, s * 6.8)],
+                    Stroke::new(1.8, col),
+                );
+            }
+        }
+    }
+
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(label)
         .clicked()
 }
 
@@ -1839,6 +2143,7 @@ enum Section {
     Alerts,
     System,
     Todo,
+    Settings,
 }
 
 /// What the collapsed pill is currently showing (already truncated + measured).
@@ -1861,6 +2166,11 @@ struct EmelkaNotch {
     tx: mpsc::Sender<Cmd>,
     upd: Arc<Mutex<Upd>>,
     section: Section,
+
+    // appearance
+    style: NotchStyle,
+    osd_enabled: bool,
+    osd: Arc<Mutex<OsdState>>,
 
     // animation / hover
     t: f32,
@@ -1941,6 +2251,11 @@ impl EmelkaNotch {
         let todos = Arc::new(Mutex::new(load_todos()));
         spawn_todo_worker(cc.egui_ctx.clone(), todos.clone(), notifs.clone());
 
+        let (style, osd_enabled) = load_settings();
+        let osd = Arc::new(Mutex::new(OsdState::default()));
+        spawn_volume_worker(cc.egui_ctx.clone(), osd.clone());
+        spawn_brightness_worker(cc.egui_ctx.clone(), osd.clone());
+
         let mut sys = System::new();
         sys.refresh_cpu_all();
         sys.refresh_memory();
@@ -1951,6 +2266,9 @@ impl EmelkaNotch {
             tx,
             upd,
             section: Section::Media,
+            style,
+            osd_enabled,
+            osd,
             t: 0.0,
             open: false,
             hover_since: None,
@@ -1994,6 +2312,31 @@ impl EmelkaNotch {
             offsets: load_offsets(),
             off_app: false,
             off_hold: None,
+        }
+    }
+
+    /// Jarak dari tepi atas jendela ke bentuk notch.
+    fn top(&self) -> f32 {
+        match self.style {
+            NotchStyle::Floating => TOP,
+            NotchStyle::Attached => 0.0,
+        }
+    }
+
+    fn corner_radius(&self, e: f32) -> CornerRadius {
+        match self.style {
+            NotchStyle::Floating => {
+                CornerRadius::same(lerp((self.pill_h / 2.0).min(22.0), 26.0, e).round() as u8)
+            }
+            NotchStyle::Attached => {
+                let r = lerp(10.0, 24.0, e).round() as u8;
+                CornerRadius {
+                    nw: 0,
+                    ne: 0,
+                    sw: r,
+                    se: r,
+                }
+            }
         }
     }
 
@@ -2042,7 +2385,7 @@ impl EmelkaNotch {
     }
 
     fn update_hover(&mut self, ctx: &egui::Context) {
-        let shape = shape_rect(self.pill_w, self.pill_h, ease(self.t));
+        let shape = shape_rect(self.pill_w, self.pill_h, ease(self.t), self.top());
         let hit = Rect::from_min_max(
             pos2(shape.left() - 4.0, 0.0),
             pos2(shape.right() + 4.0, shape.bottom() + 4.0),
@@ -2081,8 +2424,9 @@ impl EmelkaNotch {
         }
     }
 
-    /// Decide what the pill shows (notification > lyric > title > idle) and measure it.
+    /// Decide what the pill shows (osd > notification > lyric > title > idle) and measure it.
     // [offset] 4/8: new `lead` parameter
+    #[allow(clippy::too_many_arguments)]
     fn refresh_view(
         &mut self,
         p: &Painter,
@@ -2091,6 +2435,7 @@ impl EmelkaNotch {
         pos_ms: u64,
         lead: i64,
         notif: Option<&Notif>,
+        osd: Option<OsdEvent>,
     ) {
         let lyric_line = if media.playing {
             current_line(lyrics, shift(pos_ms, lead))
@@ -2099,7 +2444,13 @@ impl EmelkaNotch {
         };
 
         let (kind, main, sub, app): (u8, String, Option<String>, Option<String>) =
-            if let Some(n) = notif {
+            if let Some(o) = osd {
+                let name = match o.kind {
+                    OsdKind::Volume => "Volume",
+                    OsdKind::Brightness => "Brightness",
+                };
+                (4, name.to_string(), None, None)
+            } else if let Some(n) = notif {
                 let title = if n.title.is_empty() {
                     n.app.clone()
                 } else {
@@ -2190,10 +2541,19 @@ impl EmelkaNotch {
             let n = self.notifs.lock().unwrap();
             n.latest.clone().filter(|x| x.at.elapsed() < NOTIF_SHOW)
         };
+        let osd = if self.osd_enabled {
+            self.osd
+                .lock()
+                .unwrap()
+                .latest
+                .filter(|o| o.at.elapsed() < OSD_SHOW)
+        } else {
+            None
+        };
 
         // [offset] 5/8
         let lead = self.lead_for(&media);
-        self.refresh_view(&painter, &media, &lyrics, pos_ms, lead, notif.as_ref());
+        self.refresh_view(&painter, &media, &lyrics, pos_ms, lead, notif.as_ref(), osd);
 
         // Smoothly follow the target pill size.
         let dt = ui.input(|i| i.stable_dt).min(0.05);
@@ -2201,11 +2561,13 @@ impl EmelkaNotch {
         self.pill_w += (self.view.w - self.pill_w) * k;
         self.pill_h += (self.view.h - self.pill_h) * k;
         self.animating = notif.is_some()
+            || osd.is_some()
             || (self.view.w - self.pill_w).abs() > 0.5
             || (self.view.h - self.pill_h).abs() > 0.5;
 
-        let rect = shape_rect(self.pill_w, self.pill_h, e);
-        let radius = CornerRadius::same(lerp((self.pill_h / 2.0).min(22.0), 26.0, e).round() as u8);
+        let top = self.top();
+        let rect = shape_rect(self.pill_w, self.pill_h, e, top);
+        let radius = self.corner_radius(e);
 
         painter.rect_filled(rect, radius, BG);
         if e > 0.0 {
@@ -2252,6 +2614,41 @@ impl EmelkaNotch {
                         MUTED.gamma_multiply(a),
                     );
                 }
+            } else if v.kind == 4 {
+                // Volume / brightness: icon + progress bar + percentage (value is read live,
+                // so dragging the slider doesn't re-trigger the fade).
+                if let Some(o) = osd {
+                    let muted = o.kind == OsdKind::Volume && o.muted;
+                    let val = if muted { 0.0 } else { o.value.clamp(0.0, 1.0) };
+                    osd_icon(
+                        &p,
+                        pos2(rect.left() + 24.0, c.y),
+                        o.kind,
+                        muted,
+                        TEXT.gamma_multiply(pill_alpha),
+                    );
+                    let bar_l = rect.left() + 42.0;
+                    let bar_r = (rect.right() - 54.0).max(bar_l + 10.0);
+                    let track = Rect::from_min_max(pos2(bar_l, c.y - 2.0), pos2(bar_r, c.y + 2.0));
+                    p.rect_filled(track, CornerRadius::same(2), TRACK.gamma_multiply(a));
+                    p.rect_filled(
+                        Rect::from_min_size(track.min, vec2(track.width() * val, 4.0)),
+                        CornerRadius::same(2),
+                        (if muted { DIM } else { TEXT }).gamma_multiply(a),
+                    );
+                    let label = if muted {
+                        "Muted".to_string()
+                    } else {
+                        format!("{:.0}%", val * 100.0)
+                    };
+                    p.text(
+                        pos2(rect.right() - 16.0, c.y),
+                        Align2::RIGHT_CENTER,
+                        label,
+                        semibold(12.0),
+                        (if muted { MUTED } else { TEXT }).gamma_multiply(a),
+                    );
+                }
             } else {
                 let time = ui.input(|i| i.time) as f32;
                 let eq_color = if media.available { ACCENT } else { DIM };
@@ -2289,7 +2686,7 @@ impl EmelkaNotch {
         let panel_alpha = ((e - 0.5) / 0.5).clamp(0.0, 1.0);
         if panel_alpha > 0.0 {
             let inner = Rect::from_min_size(
-                pos2((WIN_W - PANEL_W) / 2.0 + PAD, TOP + PAD),
+                pos2((WIN_W - PANEL_W) / 2.0 + PAD, top + PAD),
                 vec2(PANEL_W - PAD * 2.0, PANEL_H - PAD * 2.0),
             );
             let mut child = ui.new_child(
@@ -2313,8 +2710,9 @@ impl EmelkaNotch {
                 (Section::Alerts, "Notification"),
                 (Section::System, "System"),
                 (Section::Todo, "Tasks"),
+                (Section::Settings, "Settings"),
             ] {
-                if tab(ui, label, self.section == s) && self.section != s {
+                if tab_icon(ui, s, label, self.section == s) && self.section != s {
                     self.prev_section = Some(self.section);
                     self.tab_dir = if (s as usize) > (self.section as usize) {
                         1.0
@@ -2381,6 +2779,7 @@ impl EmelkaNotch {
             Section::Alerts => self.alerts_section(ui),
             Section::System => self.system_section(ui),
             Section::Todo => self.todo_section(ui),
+            Section::Settings => self.settings_section(ui),
         }
     }
 
@@ -2412,6 +2811,150 @@ impl EmelkaNotch {
         {
             let (upd, notifs, ctx) = (self.upd.clone(), self.notifs.clone(), ui.ctx().clone());
             thread::spawn(move || run_update(upd, notifs, ctx, true));
+        }
+    }
+
+    fn settings_section(&mut self, ui: &mut Ui) {
+        ui.spacing_mut().item_spacing.y = 0.0;
+        ui.label(RichText::new("Appearance").font(semibold(12.0)).color(TEXT));
+        ui.add_space(6.0);
+
+        let gap = 8.0;
+        let w = (ui.available_width() - gap) / 2.0;
+        let h = 80.0;
+        let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::hover());
+        let mut chosen: Option<NotchStyle> = None;
+
+        let options = [
+            (
+                NotchStyle::Floating,
+                "Floating",
+                "Floating pill below the top edge",
+            ),
+            (
+                NotchStyle::Attached,
+                "Attached",
+                "Attached to the top edge of the screen",
+            ),
+        ];
+        for (i, (st, name, desc)) in options.iter().enumerate() {
+            let r = Rect::from_min_size(
+                pos2(row.left() + i as f32 * (w + gap), row.top()),
+                vec2(w, h),
+            );
+            let resp = btn_rect(ui, r, ("style_opt", i));
+            let sel = self.style == *st;
+            let p = ui.painter().clone();
+
+            p.rect_filled(
+                r,
+                CornerRadius::same(12),
+                if resp.hovered() {
+                    field_fill(true, false)
+                } else {
+                    CARD
+                },
+            );
+            p.rect_stroke(
+                r,
+                CornerRadius::same(12),
+                Stroke::new(
+                    if sel { 1.5 } else { 1.0 },
+                    if sel { ACCENT } else { BORDER },
+                ),
+                StrokeKind::Inside,
+            );
+
+            // mini preview
+            let pv =
+                Rect::from_min_size(pos2(r.left() + 12.0, r.top() + 10.0), vec2(w - 24.0, 30.0));
+            p.rect_filled(pv, CornerRadius::same(6), Color32::from_rgb(28, 30, 38));
+            let (pw, ph) = (56.0, 12.0);
+            let x = pv.center().x - pw / 2.0;
+            let (prect, rad) = match st {
+                NotchStyle::Floating => (
+                    Rect::from_min_size(pos2(x, pv.top() + 5.0), vec2(pw, ph)),
+                    CornerRadius::same(6),
+                ),
+                NotchStyle::Attached => (
+                    Rect::from_min_size(pos2(x, pv.top()), vec2(pw, ph)),
+                    CornerRadius {
+                        nw: 0,
+                        ne: 0,
+                        sw: 6,
+                        se: 6,
+                    },
+                ),
+            };
+            p.rect_filled(prect, rad, BG);
+
+            p.text(
+                pos2(r.left() + 12.0, r.top() + 54.0),
+                Align2::LEFT_CENTER,
+                *name,
+                semibold(12.0),
+                if sel { TEXT } else { MUTED },
+            );
+            p.text(
+                pos2(r.left() + 12.0, r.top() + 68.0),
+                Align2::LEFT_CENTER,
+                *desc,
+                FontId::proportional(10.0),
+                DIM,
+            );
+
+            if resp.clicked() {
+                chosen = Some(*st);
+            }
+        }
+
+        if let Some(s) = chosen {
+            if s != self.style {
+                self.style = s;
+                save_settings(self.style, self.osd_enabled);
+            }
+        }
+
+        // ---- OSD toggle ----
+        ui.add_space(8.0);
+        let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 28.0), Sense::hover());
+        let resp = btn_rect(ui, row, "osd_toggle");
+        let p = ui.painter().clone();
+        p.rect_filled(
+            row,
+            CornerRadius::same(10),
+            if resp.hovered() {
+                field_fill(true, false)
+            } else {
+                CARD
+            },
+        );
+        p.rect_stroke(
+            row,
+            CornerRadius::same(10),
+            Stroke::new(1.0, BORDER),
+            StrokeKind::Inside,
+        );
+        p.text(
+            pos2(row.left() + 12.0, row.center().y),
+            Align2::LEFT_CENTER,
+            "Show volume & brightness in the pill",
+            semibold(11.5),
+            TEXT,
+        );
+        let k = ui
+            .ctx()
+            .animate_bool_with_time(egui::Id::new("osd_sw"), self.osd_enabled, 0.15);
+        let sw = Rect::from_center_size(pos2(row.right() - 27.0, row.center().y), vec2(30.0, 16.0));
+        p.rect_filled(sw, CornerRadius::same(8), TRACK.lerp_to_gamma(ACCENT, k));
+        p.circle_filled(
+            pos2(lerp(sw.left() + 8.0, sw.right() - 8.0, k), sw.center().y),
+            5.5,
+            TEXT,
+        );
+        if resp.clicked() {
+            self.osd_enabled = !self.osd_enabled;
+            save_settings(self.style, self.osd_enabled);
         }
     }
 
