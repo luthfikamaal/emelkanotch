@@ -1,2 +1,7 @@
 /target
 install.ps1
+
+# JCE context index runtime state
+.opencode-jce/context/
+.opencode-jce/
+.opencode-context.md

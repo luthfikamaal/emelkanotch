@@ -16,8 +16,10 @@ pub(crate) enum Section {
     Media,
     Alerts,
     System,
+    Weather,
     Todo,
     Prayer,
+    Antigravity,
     Settings,
 }
 
@@ -275,6 +277,28 @@ pub(crate) fn tab_icon(ui: &mut Ui, sec: Section, label: &str, selected: bool) -
                 p.line_segment([pos2(c.x + 5.5, c.y + o), pos2(c.x + 8.0, c.y + o)], st);
             }
         }
+        Section::Weather => {
+            // matahari + awan kecil
+            let sc = c + vec2(-2.5, -3.0);
+            p.circle_stroke(sc, 2.8, st);
+            for k in 0..8 {
+                let a = k as f32 * PI / 4.0;
+                let (s, co) = a.sin_cos();
+                p.line_segment(
+                    [sc + vec2(co * 4.2, s * 4.2), sc + vec2(co * 5.7, s * 5.7)],
+                    Stroke::new(1.1, col),
+                );
+            }
+            let cc = c + vec2(2.0, 3.5);
+            p.circle_filled(cc + vec2(-2.5, 0.5), 2.1, col);
+            p.circle_filled(cc + vec2(0.5, -0.5), 2.7, col);
+            p.circle_filled(cc + vec2(3.0, 0.5), 1.9, col);
+            p.rect_filled(
+                Rect::from_min_max(pos2(cc.x - 2.5, cc.y + 0.5), pos2(cc.x + 3.0, cc.y + 2.8)),
+                CornerRadius::same(1),
+                col,
+            );
+        }
         Section::Todo => {
             // lingkaran + centang
             p.circle_stroke(c, 6.5, st);
@@ -298,6 +322,25 @@ pub(crate) fn tab_icon(ui: &mut Ui, sec: Section, label: &str, selected: bool) -
                 st,
             );
             p.line_segment([pos2(c.x, base - 5.5), pos2(c.x, base - 8.0)], st);
+        }
+        Section::Antigravity => {
+            // Antigravity AI Spark / Diamond core with levitating rings
+            let pts = vec![
+                pos2(c.x, c.y - 5.5),
+                pos2(c.x + 4.2, c.y),
+                pos2(c.x, c.y + 5.5),
+                pos2(c.x - 4.2, c.y),
+            ];
+            p.add(Shape::closed_line(pts, st));
+            p.circle_filled(c, 1.4, col);
+            p.line_segment(
+                [pos2(c.x - 6.5, c.y), pos2(c.x - 5.0, c.y)],
+                Stroke::new(1.2, col),
+            );
+            p.line_segment(
+                [pos2(c.x + 5.0, c.y), pos2(c.x + 6.5, c.y)],
+                Stroke::new(1.2, col),
+            );
         }
         Section::Settings => {
             // gear
@@ -533,9 +576,9 @@ pub(crate) fn stepper(
     );
 }
 
-pub(crate) fn shape_rect(pw: f32, ph: f32, e: f32, top: f32) -> Rect {
+pub(crate) fn shape_rect(pw: f32, ph: f32, e: f32, top: f32, panel_h: f32) -> Rect {
     let w = lerp(pw, crate::theme::PANEL_W, e);
-    let h = lerp(ph, crate::theme::PANEL_H, e);
+    let h = lerp(ph, panel_h, e);
     Rect::from_min_size(pos2((crate::theme::WIN_W - w) / 2.0, top), vec2(w, h))
 }
 

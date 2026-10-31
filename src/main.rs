@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod antigravity;
 mod media;
 mod notification;
 mod osd;
@@ -11,6 +12,7 @@ mod tasks;
 mod theme;
 mod ui;
 mod updater;
+mod weather;
 
 use chrono::{Datelike, Local, NaiveDate};
 use eframe::egui::{
@@ -21,6 +23,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 use sysinfo::System;
 
+use antigravity::{spawn_antigravity_worker, AntigravityState};
 use media::{spawn_media_worker, Cmd, Lyrics, Media, Shared};
 use notification::{push_notice, spawn_notif_worker, Notif, NotifState};
 use osd::{spawn_brightness_worker, spawn_volume_worker, OsdEvent, OsdKind, OsdState};
@@ -31,6 +34,7 @@ use tasks::{load_todos, spawn_todo_worker, TodoState};
 use theme::*;
 use ui::{cursor_local, push_hist, shape_rect, tab_icon, Section};
 use updater::{spawn_updater, take_updated_marker, Upd};
+use weather::{load_weather_cache, spawn_weather_worker, WeatherState};
 
 // =====================================================================
 // App
@@ -65,6 +69,7 @@ struct EmelkaNotch {
 
     // animation / hover
     t: f32,
+    panel_cur_h: f32,
     open: bool,
     hover_since: Option<Instant>,
     last_inside: Instant,
@@ -90,6 +95,8 @@ struct EmelkaNotch {
     last_disk: Instant,
 
     prayer: Arc<Mutex<PrayerState>>,
+    weather: Arc<Mutex<WeatherState>>,
+    pub(crate) antigravity: Arc<Mutex<AntigravityState>>,
 
     // tasks
     todos: Arc<Mutex<TodoState>>,
@@ -146,6 +153,10 @@ impl EmelkaNotch {
         let prayer = Arc::new(Mutex::new(load_prayer_cache()));
         spawn_prayer_worker(cc.egui_ctx.clone(), prayer.clone());
         spawn_prayer_notifier(cc.egui_ctx.clone(), prayer.clone(), notifs.clone());
+        let weather = Arc::new(Mutex::new(load_weather_cache()));
+        spawn_weather_worker(cc.egui_ctx.clone(), weather.clone());
+        let antigravity = Arc::new(Mutex::new(AntigravityState::default()));
+        spawn_antigravity_worker(cc.egui_ctx.clone(), antigravity.clone());
         let (style, osd_enabled) = load_settings();
         let osd = Arc::new(Mutex::new(OsdState::default()));
         spawn_volume_worker(cc.egui_ctx.clone(), osd.clone());
@@ -170,6 +181,7 @@ impl EmelkaNotch {
             osd_enabled,
             osd,
             t: 0.0,
+            panel_cur_h: PANEL_H,
             open: false,
             hover_since: None,
             last_inside: Instant::now(),
@@ -192,6 +204,8 @@ impl EmelkaNotch {
             disks: read_disks(),
             last_disk: Instant::now(),
             prayer,
+            weather,
+            antigravity,
             todos,
             todo_text: String::new(),
             todo_due: None,
@@ -217,6 +231,20 @@ impl EmelkaNotch {
 
     fn top(&self) -> f32 {
         lerp(TOP, 0.0, self.style_t)
+    }
+
+    /// Weather and Antigravity get taller panels so cards have room to breathe.
+    /// Keep it tall through the slide transition so the outgoing content isn't clipped.
+    fn panel_target_h(&self) -> f32 {
+        if self.section == Section::Weather || self.prev_section == Some(Section::Weather) {
+            WEATHER_PANEL_H
+        } else if self.section == Section::Antigravity
+            || self.prev_section == Some(Section::Antigravity)
+        {
+            ANTIGRAVITY_PANEL_H
+        } else {
+            PANEL_H
+        }
     }
 
     fn corner_radius(&self, e: f32) -> CornerRadius {
@@ -279,7 +307,23 @@ impl EmelkaNotch {
     }
 
     fn update_hover(&mut self, ctx: &egui::Context) {
-        let shape = shape_rect(self.pill_w, self.pill_h, ease(self.t), self.top());
+        let dt = ctx.input(|i| i.stable_dt).min(0.05);
+        let target_h = self.panel_target_h();
+        let kh = 1.0 - (-dt * 14.0).exp();
+        self.panel_cur_h += (target_h - self.panel_cur_h) * kh;
+        if (target_h - self.panel_cur_h).abs() < 0.5 {
+            self.panel_cur_h = target_h;
+        } else {
+            ctx.request_repaint();
+        }
+
+        let shape = shape_rect(
+            self.pill_w,
+            self.pill_h,
+            ease(self.t),
+            self.top(),
+            self.panel_cur_h,
+        );
         let slack = if self.open { 6.0 } else { 28.0 };
         let half = (shape.width() / 2.0 + slack).max(if self.open { 0.0 } else { 120.0 });
         let cx = shape.center().x;
@@ -304,7 +348,6 @@ impl EmelkaNotch {
         };
 
         // Animate
-        let dt = ctx.input(|i| i.stable_dt).min(0.05);
         let step = dt / if self.open { 0.40 } else { 0.30 };
         self.t = if self.open {
             (self.t + step).min(1.0)
@@ -312,8 +355,10 @@ impl EmelkaNotch {
             (self.t - step).max(0.0)
         };
 
-        // Let clicks fall through the transparent area when collapsed and not hovered.
-        let want_passthrough = !(inside || self.t > 0.0);
+        // Let clicks fall through the transparent area below the panel, but keep
+        // the window interactive while dragging a control inside it.
+        let dragging = ctx.input(|i| i.pointer.any_down());
+        let want_passthrough = !(inside || dragging);
         if want_passthrough != self.passthrough {
             self.passthrough = want_passthrough;
             ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(want_passthrough));
@@ -460,7 +505,8 @@ impl EmelkaNotch {
             || (self.view.h - self.pill_h).abs() > 0.5;
 
         let top = self.top();
-        let rect = shape_rect(self.pill_w, self.pill_h, e, top);
+        let panel_h = self.panel_cur_h;
+        let rect = shape_rect(self.pill_w, self.pill_h, e, top, panel_h);
         let radius = self.corner_radius(e);
 
         painter.rect_filled(rect, radius, BG);
@@ -579,7 +625,7 @@ impl EmelkaNotch {
         if panel_alpha > 0.0 {
             let inner = Rect::from_min_size(
                 pos2((WIN_W - PANEL_W) / 2.0 + PAD, top + PAD),
-                vec2(PANEL_W - PAD * 2.0, PANEL_H - PAD * 2.0),
+                vec2(PANEL_W - PAD * 2.0, panel_h - PAD * 2.0),
             );
             let mut child = ui.new_child(
                 UiBuilder::new()
@@ -601,8 +647,10 @@ impl EmelkaNotch {
                 (Section::Media, "Media"),
                 (Section::Alerts, "Notification"),
                 (Section::System, "System"),
+                (Section::Weather, "Weather"),
                 (Section::Todo, "Tasks"),
                 (Section::Prayer, "Prayer"),
+                (Section::Antigravity, "Antigravity"),
                 (Section::Settings, "Settings"),
             ] {
                 if tab_icon(ui, s, label, self.section == s) && self.section != s {
@@ -671,8 +719,10 @@ impl EmelkaNotch {
             Section::Media => self.media_section(ui, media, pos_ms, lyrics),
             Section::Alerts => self.alerts_section(ui),
             Section::System => self.system_section(ui),
+            Section::Weather => self.weather_section(ui),
             Section::Todo => self.todo_section(ui),
             Section::Prayer => self.prayer_section(ui),
+            Section::Antigravity => self.antigravity_section(ui),
             Section::Settings => self.settings_section(ui),
         }
     }

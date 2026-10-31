@@ -2,6 +2,7 @@
 // Section rendering (impl block tambahan untuk EmelkaNotch)
 // =====================================================================
 
+use crate::antigravity::AuthStatus;
 use crate::media::{self, app_key, track_key, Lyrics, Media, LYRIC_LEAD_MS};
 use crate::notification::activate_notif;
 use crate::prayer::{fmt_hm, prayer_color, prayer_icon, MAIN_PRAYERS, PRAYER_NAMES};
@@ -1678,6 +1679,272 @@ impl EmelkaNotch {
                 st.items.retain(|t| t.id != id);
             }
             save_todos(&st.items);
+        }
+    }
+
+    pub(crate) fn weather_section(&mut self, ui: &mut Ui) {
+        let retry = {
+            let st = self.weather.lock().unwrap();
+            crate::weather::draw_weather_panel(ui, &st)
+        };
+        if retry {
+            self.weather.lock().unwrap().retry = true;
+        }
+    }
+
+    pub(crate) fn antigravity_section(&mut self, ui: &mut Ui) {
+        ui.spacing_mut().item_spacing.y = 6.0;
+
+        let (status, quota, is_loading) = {
+            let st = self.antigravity.lock().unwrap();
+            (st.status.clone(), st.quota.clone(), st.is_loading)
+        };
+
+        let w = ui.available_width();
+
+        if let Some(q) = quota {
+            // 1. Header card
+            let h_head = 54.0;
+            let (r_head, p_head) = card(ui, w, h_head);
+
+            p_head.text(
+                pos2(r_head.left() + 14.0, r_head.top() + 18.0),
+                Align2::LEFT_CENTER,
+                "Models & Quota",
+                semibold(14.0),
+                TEXT,
+            );
+
+            let acc_text = format!("Account: {}", q.account);
+            p_head.text(
+                pos2(r_head.left() + 14.0, r_head.top() + 38.0),
+                Align2::LEFT_CENTER,
+                &acc_text,
+                FontId::proportional(11.0),
+                MUTED,
+            );
+
+            // Actions: Refresh + Sign out
+            let btn_w = 58.0;
+            let btn_h = 24.0;
+            let r_logout = Rect::from_min_size(
+                pos2(
+                    r_head.right() - btn_w - 12.0,
+                    r_head.center().y - btn_h / 2.0,
+                ),
+                vec2(btn_w, btn_h),
+            );
+            if text_btn(ui, &p_head, r_logout, "Sign out", "ag_logout", false, true) {
+                self.antigravity.lock().unwrap().trigger_logout = true;
+            }
+
+            let r_refresh = Rect::from_min_size(
+                pos2(r_logout.left() - 32.0, r_head.center().y - btn_h / 2.0),
+                vec2(26.0, btn_h),
+            );
+            let ref_label = if is_loading { "…" } else { "↻" };
+            if text_btn(
+                ui,
+                &p_head,
+                r_refresh,
+                ref_label,
+                "ag_refresh",
+                false,
+                !is_loading,
+            ) {
+                self.antigravity.lock().unwrap().trigger_refresh = true;
+            }
+
+            // 2. Scrollable Quota Groups Card
+            let h_body = (ui.available_height() - 4.0).max(180.0);
+            let (r_body, _) = card(ui, w, h_body);
+
+            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(r_body.shrink(10.0)));
+
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(&mut child, |ui| {
+                    ui.spacing_mut().item_spacing.y = 8.0;
+
+                    for group in &q.groups {
+                        ui.add_space(2.0);
+                        ui.label(
+                            egui::RichText::new(group.name.to_uppercase())
+                                .font(semibold(11.5))
+                                .color(TEXT),
+                        );
+
+                        if !group.description.is_empty() {
+                            ui.label(
+                                egui::RichText::new(&group.description)
+                                    .font(FontId::proportional(10.0))
+                                    .color(MUTED),
+                            );
+                        }
+
+                        for bucket in &group.buckets {
+                            ui.add_space(2.0);
+                            let pct = (bucket.remaining_fraction * 100.0).clamp(0.0, 100.0);
+                            let pct_str = format!("{:.2}%", pct);
+
+                            // Title row: Bucket name & percentage
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new(&bucket.name)
+                                        .font(semibold(11.0))
+                                        .color(TEXT),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        ui.label(
+                                            egui::RichText::new(&pct_str)
+                                                .font(semibold(11.5))
+                                                .color(TEXT),
+                                        );
+                                    },
+                                );
+                            });
+
+                            // Progress bar
+                            let bar_h = 7.0;
+                            let (bar_rect, _) = ui.allocate_exact_size(
+                                vec2(ui.available_width(), bar_h),
+                                Sense::hover(),
+                            );
+                            let p_bar = ui.painter();
+                            p_bar.rect_filled(bar_rect, CornerRadius::same(3), TRACK);
+
+                            if bucket.remaining_fraction > 0.0 {
+                                let fill_w = bar_rect.width() * bucket.remaining_fraction.min(1.0);
+                                let fill_rect =
+                                    Rect::from_min_size(bar_rect.min, vec2(fill_w, bar_h));
+                                let fill_col = if pct < 20.0 { WARN } else { GREEN };
+                                p_bar.rect_filled(fill_rect, CornerRadius::same(3), fill_col);
+                            }
+
+                            // Reset subtitle (e.g. "Refreshes in 167h 23m" or "Quota available")
+                            let reset_str = crate::antigravity::format_reset_info(
+                                bucket.reset_time.as_deref(),
+                                bucket.remaining_fraction,
+                            );
+                            ui.label(
+                                egui::RichText::new(reset_str)
+                                    .font(FontId::proportional(10.0))
+                                    .color(GREEN),
+                            );
+                        }
+
+                        ui.add_space(6.0);
+                    }
+                });
+        } else {
+            match status {
+                AuthStatus::Authenticating { port } => {
+                    let h_card = 200.0;
+                    let (r, p) = card(ui, w, h_card);
+
+                    p.text(
+                        pos2(r.center().x, r.top() + 45.0),
+                        Align2::CENTER_CENTER,
+                        "Browser Authorization",
+                        semibold(15.0),
+                        TEXT,
+                    );
+
+                    let msg = format!(
+                        "A browser window was opened for Google OAuth sign in.\nListening for callback on 127.0.0.1:{}...",
+                        port
+                    );
+                    p.text(
+                        pos2(r.center().x, r.top() + 85.0),
+                        Align2::CENTER_CENTER,
+                        &msg,
+                        FontId::proportional(11.5),
+                        MUTED,
+                    );
+
+                    let cancel_w = 90.0;
+                    let cancel_h = 28.0;
+                    let r_cancel = Rect::from_center_size(
+                        pos2(r.center().x, r.top() + 140.0),
+                        vec2(cancel_w, cancel_h),
+                    );
+                    if text_btn(ui, &p, r_cancel, "Cancel", "ag_cancel_oauth", false, true) {
+                        let mut st = self.antigravity.lock().unwrap();
+                        st.status = AuthStatus::LoggedOut;
+                    }
+                }
+                AuthStatus::LoggedOut | AuthStatus::Error(_) => {
+                    let h_card = 220.0;
+                    let (r, p) = card(ui, w, h_card);
+
+                    let ic_c = pos2(r.center().x, r.top() + 40.0);
+                    let pts = vec![
+                        pos2(ic_c.x, ic_c.y - 7.0),
+                        pos2(ic_c.x + 5.5, ic_c.y),
+                        pos2(ic_c.x, ic_c.y + 7.0),
+                        pos2(ic_c.x - 5.5, ic_c.y),
+                    ];
+                    p.add(egui::Shape::closed_line(pts, Stroke::new(1.5, ACCENT)));
+                    p.circle_filled(ic_c, 1.8, ACCENT);
+
+                    p.text(
+                        pos2(r.center().x, r.top() + 75.0),
+                        Align2::CENTER_CENTER,
+                        "Antigravity Models & Quota",
+                        semibold(15.0),
+                        TEXT,
+                    );
+
+                    p.text(
+                        pos2(r.center().x, r.top() + 102.0),
+                        Align2::CENTER_CENTER,
+                        "Sign in with Google OAuth to track your Antigravity models and quota.",
+                        FontId::proportional(11.5),
+                        MUTED,
+                    );
+
+                    if let AuthStatus::Error(ref err) = status {
+                        p.text(
+                            pos2(r.center().x, r.top() + 125.0),
+                            Align2::CENTER_CENTER,
+                            err,
+                            FontId::proportional(10.5),
+                            WARN,
+                        );
+                    }
+
+                    let btn_w = 200.0;
+                    let btn_h = 32.0;
+                    let r_login = Rect::from_center_size(
+                        pos2(r.center().x, r.top() + 160.0),
+                        vec2(btn_w, btn_h),
+                    );
+                    if text_btn(
+                        ui,
+                        &p,
+                        r_login,
+                        "Sign in with Google OAuth",
+                        "ag_login_btn",
+                        true,
+                        true,
+                    ) {
+                        self.antigravity.lock().unwrap().trigger_login = true;
+                    }
+                }
+                _ => {
+                    let h_card = 160.0;
+                    let (r, p) = card(ui, w, h_card);
+                    p.text(
+                        pos2(r.center().x, r.center().y),
+                        Align2::CENTER_CENTER,
+                        "Loading Models & Quota...",
+                        semibold(13.0),
+                        MUTED,
+                    );
+                }
+            }
         }
     }
 }

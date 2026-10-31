@@ -12,13 +12,15 @@ use std::time::Duration;
 // ---------- layout ----------
 pub(crate) const PANEL_W: f32 = 500.0;
 pub(crate) const PANEL_H: f32 = 212.0;
+pub(crate) const WEATHER_PANEL_H: f32 = 358.0;
+pub(crate) const ANTIGRAVITY_PANEL_H: f32 = 358.0;
 pub(crate) const PILL_W: f32 = 240.0;
 pub(crate) const PILL_H: f32 = 34.0;
 pub(crate) const NOTIF_H: f32 = 52.0;
 pub(crate) const TOP: f32 = 6.0;
 pub(crate) const PAD: f32 = 16.0;
 pub(crate) const WIN_W: f32 = PANEL_W + 20.0;
-pub(crate) const WIN_H: f32 = PANEL_H + TOP + 12.0;
+pub(crate) const WIN_H: f32 = WEATHER_PANEL_H + TOP + 12.0;
 
 pub(crate) const NOTIF_SHOW: Duration = Duration::from_secs(5);
 pub(crate) const OSD_SHOW: Duration = Duration::from_millis(1600);

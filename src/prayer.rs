@@ -227,7 +227,7 @@ fn fetch_month(prov: &str, kab: &str, year: i32, month: u32) -> Result<Vec<Praye
 
 // ---------- location ----------
 
-fn win_coords() -> Option<(f64, f64)> {
+pub(crate) fn win_coords() -> Option<(f64, f64)> {
     use windows::Devices::Geolocation::Geolocator;
     use windows::Foundation::TimeSpan;
     let g = Geolocator::new().ok()?;
@@ -247,7 +247,7 @@ fn win_coords() -> Option<(f64, f64)> {
     Some((p.Latitude, p.Longitude))
 }
 
-fn ip_coords() -> Option<(f64, f64)> {
+pub(crate) fn ip_coords() -> Option<(f64, f64)> {
     let v: serde_json::Value = ureq::get("https://ipwho.is/")
         .set("User-Agent", UA)
         .timeout(Duration::from_secs(8))
@@ -262,7 +262,10 @@ fn ip_coords() -> Option<(f64, f64)> {
 }
 
 /// (provinsi, kandidat kab/kota + apakah "kota"(true) / "kabupaten"(false) / tidak diketahui)
-fn reverse_geocode(lat: f64, lon: f64) -> Result<(String, Vec<(String, Option<bool>)>), String> {
+pub(crate) fn reverse_geocode(
+    lat: f64,
+    lon: f64,
+) -> Result<(String, Vec<(String, Option<bool>)>), String> {
     let v: serde_json::Value = ureq::get("https://nominatim.openstreetmap.org/reverse")
         .set("User-Agent", UA)
         .set("Accept-Language", "id")
