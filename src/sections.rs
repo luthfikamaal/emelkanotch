@@ -205,18 +205,34 @@ impl EmelkaNotch {
         if items.is_empty() {
             self.notif_clear = None;
             self.notif_out.clear();
-            ui.add_space(26.0);
-            ui.vertical_centered(|ui| {
-                ui.label(
-                    egui::RichText::new("No notifications yet")
-                        .font(semibold(14.0))
-                        .color(TEXT),
-                );
-                ui.add_space(2.0);
-                ui.label(small(err.unwrap_or_else(|| {
-                    "New Windows notifications will show up here.".into()
-                })));
-            });
+            let w = ui.available_width();
+            let h = ui.available_height().max(120.0);
+            let (empty_r, p) = card(ui, w, h);
+            let cx = empty_r.center().x;
+            let cy = empty_r.center().y;
+
+            let badge_c = pos2(cx, cy - 18.0);
+            p.circle_filled(badge_c, 13.0, ACCENT.gamma_multiply(0.14));
+            p.circle_stroke(badge_c, 13.0, Stroke::new(1.0, ACCENT.gamma_multiply(0.35)));
+            let s = Stroke::new(1.7, ACCENT);
+            p.line_segment([badge_c + vec2(-4.5, 0.5), badge_c + vec2(-1.2, 3.8)], s);
+            p.line_segment([badge_c + vec2(-1.2, 3.8), badge_c + vec2(5.0, -3.5)], s);
+
+            p.text(
+                pos2(cx, cy + 6.0),
+                Align2::CENTER_CENTER,
+                "All caught up — no notifications",
+                semibold(12.5),
+                TEXT,
+            );
+            let sub = err.unwrap_or_else(|| "New Windows notifications will appear here".into());
+            p.text(
+                pos2(cx, cy + 23.0),
+                Align2::CENTER_CENTER,
+                sub,
+                FontId::proportional(11.0),
+                MUTED,
+            );
             return;
         }
 
@@ -227,12 +243,14 @@ impl EmelkaNotch {
 
         // ---- header: count + "Clear all" ----
         let (head, _) = ui.allocate_exact_size(vec2(ui.available_width(), 20.0), Sense::hover());
+        ui.painter()
+            .circle_filled(pos2(head.left() + 6.0, head.center().y), 3.0, ACCENT);
         ui.painter().text(
-            pos2(head.left() + 4.0, head.center().y),
+            pos2(head.left() + 14.0, head.center().y),
             Align2::LEFT_CENTER,
             format!("{total} notification{}", if total == 1 { "" } else { "s" }),
             FontId::proportional(10.5),
-            DIM,
+            MUTED,
         );
         let label = "Clear all";
         let gw = text_w(ui.painter(), label, &FontId::proportional(10.5));
@@ -256,10 +274,12 @@ impl EmelkaNotch {
             start_all = true;
         }
 
+        ui.add_space(2.0);
+
         // ---- items: hover shows an x; removed rows slide right, fade, then collapse ----
         let anim_all = self.notif_clear.map(|t| t.elapsed().as_secs_f32());
         let mut animating = anim_all.is_some() || !self.notif_out.is_empty();
-        ui.spacing_mut().item_spacing.y = 2.0;
+        ui.spacing_mut().item_spacing.y = 4.0;
         for (i, n) in items.iter().enumerate() {
             let k = if let Some(el) = anim_all {
                 Some(((el - i as f32 * STAGGER) / DUR).clamp(0.0, 1.0))
@@ -293,19 +313,35 @@ impl EmelkaNotch {
                 p.set_opacity(1.0 - k);
             }
             let hovered = resp.hovered() && !exiting;
-            if hovered {
-                p.rect_filled(full, CornerRadius::same(8), Color32::from_rgb(16, 17, 22));
-            }
+            let row_bg = if hovered {
+                Color32::from_rgb(21, 23, 30)
+            } else {
+                CARD
+            };
+            p.rect_filled(full, CornerRadius::same(8), row_bg);
+            p.rect_stroke(
+                full,
+                CornerRadius::same(8),
+                Stroke::new(
+                    1.0,
+                    if hovered {
+                        BORDER
+                    } else {
+                        Color32::from_rgb(26, 28, 36)
+                    },
+                ),
+                StrokeKind::Inside,
+            );
             app_icon(
                 &p,
-                pos2(full.left() + 16.0, full.center().y),
+                pos2(full.left() + 18.0, full.center().y),
                 11.0,
                 tex.as_ref(),
                 &n.app,
                 1.0,
             );
 
-            let max = w - 40.0 - 48.0;
+            let max = w - 42.0 - 52.0;
             let title_src = if n.title.is_empty() { &n.app } else { &n.title };
             let (title, _) = fit(&p, &one_line(title_src), semibold(12.0), max);
             let (body, _) = fit(&p, &one_line(&n.body), FontId::proportional(11.0), max);
@@ -318,7 +354,7 @@ impl EmelkaNotch {
                 TEXT,
             );
             p.text(
-                pos2(full.left() + 38.0, full.top() + 26.0),
+                pos2(full.left() + 38.0, full.top() + 25.5),
                 Align2::LEFT_CENTER,
                 body,
                 FontId::proportional(11.0),
@@ -326,15 +362,18 @@ impl EmelkaNotch {
             );
             if hovered {
                 // ---- dismiss button (x), di kanan: klik ini TIDAK membuka apa pun ----
-                let x_rect = Rect::from_min_size(
-                    pos2(full.right() - 26.0, full.center().y - 12.0),
-                    vec2(24.0, 24.0),
+                let x_rect = Rect::from_center_size(
+                    pos2(full.right() - 16.0, full.center().y),
+                    vec2(22.0, 22.0),
                 );
                 let xr = btn_rect(ui, x_rect, ("notif_x", i));
-                let c = pos2(full.right() - 14.0, full.center().y);
-                let st = Stroke::new(1.3, if xr.hovered() { TEXT } else { MUTED });
-                p.line_segment([c + vec2(-3.5, -3.5), c + vec2(3.5, 3.5)], st);
-                p.line_segment([c + vec2(-3.5, 3.5), c + vec2(3.5, -3.5)], st);
+                if xr.hovered() {
+                    p.rect_filled(x_rect, CornerRadius::same(5), WARN.gamma_multiply(0.18));
+                }
+                let c = x_rect.center();
+                let st = Stroke::new(1.3, if xr.hovered() { WARN } else { MUTED });
+                p.line_segment([c + vec2(-3.2, -3.2), c + vec2(3.2, 3.2)], st);
+                p.line_segment([c + vec2(-3.2, 3.2), c + vec2(3.2, -3.2)], st);
                 if xr.clicked() {
                     start_one = Some(n.at);
                 }
@@ -347,7 +386,7 @@ impl EmelkaNotch {
                 resp.on_hover_cursor(egui::CursorIcon::PointingHand);
             } else {
                 p.text(
-                    pos2(full.right() - 8.0, full.center().y),
+                    pos2(full.right() - 10.0, full.center().y),
                     Align2::RIGHT_CENTER,
                     ago(n.at),
                     FontId::proportional(10.0),
@@ -765,7 +804,7 @@ impl EmelkaNotch {
 
         let gap = 8.0;
         let w = (ui.available_width() - gap * 2.0) / 3.0;
-        let h = 132.0;
+        let h = ui.available_height().max(132.0);
         let chart = |r: Rect| {
             Rect::from_min_max(
                 pos2(r.left() + 12.0, r.top() + 34.0),
@@ -919,22 +958,22 @@ impl EmelkaNotch {
             )
         };
 
-        // ---- belum ada data: loading / error ----
+        // ---- no data yet: loading / error ----
         let Some(day) = today_d else {
             let mut retry = false;
             ui.add_space(18.0);
             ui.vertical_centered(|ui| {
                 let (title, sub) = match &status {
                     crate::prayer::PrayerStatus::Error(e) => {
-                        ("Jadwal belum tersedia".to_string(), ellipsize(e, 70))
+                        ("Schedule unavailable".to_string(), ellipsize(e, 70))
                     }
                     crate::prayer::PrayerStatus::Loading => (
-                        "Mengambil jadwal sholat…".to_string(),
-                        "Sumber: equran.id (Kemenag RI)".to_string(),
+                        "Loading prayer times…".to_string(),
+                        "Source: equran.id (Kemenag RI)".to_string(),
                     ),
                     _ => (
-                        "Mencari lokasimu…".to_string(),
-                        "Memakai lokasi perangkat, fallback ke IP".to_string(),
+                        "Detecting your location…".to_string(),
+                        "Using device location, IP fallback".to_string(),
                     ),
                 };
                 ui.label(egui::RichText::new(title).font(semibold(14.0)).color(TEXT));
@@ -944,20 +983,27 @@ impl EmelkaNotch {
                     ui.add_space(8.0);
                     let (r, _) = ui.allocate_exact_size(vec2(92.0, 26.0), Sense::hover());
                     let p = ui.painter().clone();
-                    if text_btn(ui, &p, r, "Coba lagi", "pr_retry", true, true) {
+                    if text_btn(ui, &p, r, "Retry", "pr_retry", true, true) {
                         retry = true;
                     }
                 }
             });
             if retry {
-                let mut s = self.prayer.lock().unwrap();
-                s.retry = true;
-                s.status = crate::prayer::PrayerStatus::Locating;
+                {
+                    let mut s = self.prayer.lock().unwrap();
+                    s.retry = true;
+                    s.status = crate::prayer::PrayerStatus::Locating;
+                }
+                {
+                    let mut w = self.weather.lock().unwrap();
+                    w.retry = true;
+                    w.status = crate::weather::WeatherStatus::Locating;
+                }
             }
             return;
         };
 
-        // ---- hitung sholat berikutnya ----
+        // ---- calculate next prayer ----
         let now = Local::now();
         let secs = now.num_seconds_from_midnight() as i64;
         let times: [i64; 8] = day.t.map(|m| m as i64 * 60);
@@ -967,7 +1013,7 @@ impl EmelkaNotch {
         let (next_i, next_at) = match next_idx {
             Some(i) => (i, times[i]),
             None => {
-                // lewat Isya -> Subuh besok (kalau data besok belum ada, pakai perkiraan hari ini)
+                // past Isha -> tomorrow's Fajr
                 let t = tomorrow_d.map_or(times[1], |d| d.t[1] as i64 * 60);
                 (1usize, 86_400 + t)
             }
@@ -995,9 +1041,11 @@ impl EmelkaNotch {
         };
 
         // =============== HERO ===============
+        ui.spacing_mut().item_spacing.y = 0.0;
         let w = ui.available_width();
         let col = prayer_color(next_i);
-        let (hero, _) = ui.allocate_exact_size(vec2(w, 56.0), Sense::hover());
+        let hero_h = 66.0;
+        let (hero, _) = ui.allocate_exact_size(vec2(w, hero_h), Sense::hover());
         let p = ui.painter().clone();
         let hero_bg = CARD.lerp_to_gamma(col, 0.10);
         p.rect_filled(hero, CornerRadius::same(12), hero_bg);
@@ -1008,43 +1056,43 @@ impl EmelkaNotch {
             StrokeKind::Inside,
         );
 
-        // ikon + countdown
-        let ic = pos2(hero.left() + 30.0, hero.top() + 26.0);
+        // icon + countdown
+        let ic = pos2(hero.left() + 30.0, hero.top() + 29.0);
         let ic_bg = hero_bg.lerp_to_gamma(col, 0.22);
         p.circle_filled(ic, 18.0, ic_bg);
         prayer_icon(&p, ic, next_i, col, ic_bg);
         p.text(
-            pos2(hero.left() + 58.0, hero.top() + 15.0),
+            pos2(hero.left() + 58.0, hero.top() + 19.0),
             Align2::LEFT_CENTER,
             format!(
-                "Menuju {}{}",
+                "Until {}{}",
                 PRAYER_NAMES[next_i],
-                if tomorrow { " (besok)" } else { "" }
+                if tomorrow { " (tomorrow)" } else { "" }
             ),
             FontId::proportional(10.5),
             MUTED,
         );
         p.text(
-            pos2(hero.left() + 58.0, hero.top() + 34.0),
+            pos2(hero.left() + 58.0, hero.top() + 38.5),
             Align2::LEFT_CENTER,
             cd,
             semibold(20.0),
             TEXT,
         );
 
-        // Imsak / Terbit / Dhuha
+        // Imsak / Sunrise / Dhuha
         let x0 = hero.left() + 170.0;
         for (j, idx) in [0usize, 2, 3].into_iter().enumerate() {
             let cx = x0 + j as f32 * 58.0 + 29.0;
             p.text(
-                pos2(cx, hero.top() + 19.0),
+                pos2(cx, hero.top() + 20.5),
                 Align2::CENTER_CENTER,
                 PRAYER_NAMES[idx],
                 FontId::proportional(10.0),
                 prayer_color(idx),
             );
             p.text(
-                pos2(cx, hero.top() + 34.0),
+                pos2(cx, hero.top() + 38.0),
                 Align2::CENTER_CENTER,
                 fmt_hm(day.t[idx]),
                 semibold(12.0),
@@ -1052,41 +1100,65 @@ impl EmelkaNotch {
             );
         }
 
-        // waktu berikutnya + lokasi (klik = deteksi ulang)
+        // next prayer time + location (click = re-detect)
         p.text(
-            pos2(hero.right() - 14.0, hero.top() + 19.0),
+            pos2(hero.right() - 14.0, hero.top() + 20.5),
             Align2::RIGHT_CENTER,
             fmt_hm(shown(next_i)),
             semibold(17.0),
             col,
         );
-        let loc_txt = ellipsize(kab.trim_start_matches("Kota "), 18);
+        let is_updating = matches!(
+            status,
+            crate::prayer::PrayerStatus::Locating | crate::prayer::PrayerStatus::Loading
+        );
+        let loc_txt = if is_updating {
+            "Locating…".to_string()
+        } else {
+            ellipsize(kab.trim_start_matches("Kota "), 18)
+        };
         let lf = FontId::proportional(10.5);
         let lw = text_w(&p, &loc_txt, &lf);
         let loc_rect = Rect::from_min_max(
-            pos2(hero.right() - lw - 36.0, hero.top() + 28.0),
-            pos2(hero.right() - 6.0, hero.top() + 46.0),
+            pos2(hero.right() - lw - 36.0, hero.top() + 30.0),
+            pos2(hero.right() - 6.0, hero.top() + 48.0),
         );
-        let lr = btn_rect(ui, loc_rect, "pr_loc").on_hover_text("Klik untuk deteksi ulang lokasi");
-        let lcol = if lr.hovered() { TEXT } else { MUTED };
+        let lr =
+            btn_rect(ui, loc_rect, "pr_loc").on_hover_text("Click to re-detect location & refresh");
+        let lcol = if is_updating {
+            col
+        } else if lr.hovered() {
+            TEXT
+        } else {
+            MUTED
+        };
         p.text(
-            pos2(hero.right() - 14.0, hero.top() + 37.0),
+            pos2(hero.right() - 14.0, hero.top() + 39.5),
             Align2::RIGHT_CENTER,
             &loc_txt,
             lf,
             lcol,
         );
-        let pin = pos2(hero.right() - 14.0 - lw - 9.0, hero.top() + 37.0);
+        let pin = pos2(hero.right() - 14.0 - lw - 9.0, hero.top() + 39.5);
         p.circle_stroke(pin, 2.6, Stroke::new(1.1, lcol));
         p.circle_filled(pin, 0.9, lcol);
         if lr.clicked() {
-            self.prayer.lock().unwrap().retry = true;
+            {
+                let mut s = self.prayer.lock().unwrap();
+                s.retry = true;
+                s.status = crate::prayer::PrayerStatus::Locating;
+            }
+            {
+                let mut w = self.weather.lock().unwrap();
+                w.retry = true;
+                w.status = crate::weather::WeatherStatus::Locating;
+            }
         }
 
-        // progress bar antar sholat
+        // progress bar between prayers
         let track = Rect::from_min_max(
-            pos2(hero.left() + 14.0, hero.bottom() - 7.0),
-            pos2(hero.right() - 14.0, hero.bottom() - 5.0),
+            pos2(hero.left() + 14.0, hero.bottom() - 9.5),
+            pos2(hero.right() - 14.0, hero.bottom() - 7.0),
         );
         p.rect_filled(track, CornerRadius::same(1), TRACK);
         p.rect_filled(
@@ -1095,11 +1167,11 @@ impl EmelkaNotch {
             col,
         );
 
-        // =============== 5 KARTU ===============
-        ui.add_space(8.0);
+        // =============== 5 CARDS ===============
+        ui.add_space(10.0);
         let gap = 6.0;
         let cw = (w - gap * 4.0) / 5.0;
-        let ch = 60.0;
+        let ch = ui.available_height().max(72.0);
         let (row, _) = ui.allocate_exact_size(vec2(w, ch), Sense::hover());
         for (n, &i) in MAIN_PRAYERS.iter().enumerate() {
             let r = Rect::from_min_size(
@@ -1134,13 +1206,13 @@ impl EmelkaNotch {
             );
             prayer_icon(
                 &p,
-                pos2(r.center().x, r.top() + 17.0),
+                pos2(r.center().x, r.top() + r.height() * 0.28),
                 i,
                 if passed { DIM } else { c },
                 bgc,
             );
             p.text(
-                pos2(r.center().x, r.top() + 35.0),
+                pos2(r.center().x, r.top() + r.height() * 0.54),
                 Align2::CENTER_CENTER,
                 PRAYER_NAMES[i],
                 FontId::proportional(10.5),
@@ -1153,7 +1225,7 @@ impl EmelkaNotch {
                 },
             );
             p.text(
-                pos2(r.center().x, r.top() + 49.0),
+                pos2(r.center().x, r.top() + r.height() * 0.77),
                 Align2::CENTER_CENTER,
                 fmt_hm(shown(i)),
                 semibold(13.0),
@@ -1166,8 +1238,8 @@ impl EmelkaNotch {
                 },
             );
             if is_cur {
-                // titik kecil = waktu sholat yang sedang berlangsung
-                p.circle_filled(pos2(r.right() - 9.0, r.top() + 9.0), 2.5, c);
+                // small dot = currently active prayer time
+                p.circle_filled(pos2(r.right() - 10.0, r.top() + 10.0), 2.5, c);
             }
         }
     }
@@ -1196,6 +1268,21 @@ impl EmelkaNotch {
             CornerRadius::same(FIELD_R),
             field_fill(hovered, focused),
         );
+        ui.painter().rect_stroke(
+            task,
+            CornerRadius::same(FIELD_R),
+            Stroke::new(
+                1.0,
+                if focused {
+                    ACCENT.gamma_multiply(0.65)
+                } else if hovered {
+                    BORDER
+                } else {
+                    Color32::from_rgb(30, 32, 40)
+                },
+            ),
+            StrokeKind::Inside,
+        );
         if ui
             .interact(task, egui::Id::new("todo_text_box"), Sense::click())
             .clicked()
@@ -1217,7 +1304,7 @@ impl EmelkaNotch {
                             .desired_width(inner.width())
                             .font(FontId::proportional(12.5))
                             .text_color(TEXT)
-                            .hint_text(egui::RichText::new("Add a task…").color(DIM)),
+                            .hint_text(egui::RichText::new("Add a new task…").color(DIM)),
                     )
                 },
             )
@@ -1233,12 +1320,36 @@ impl EmelkaNotch {
             None
         };
         let main = main.on_hover_cursor(egui::CursorIcon::PointingHand);
+        let has_due = self.todo_due.is_some();
         ui.painter().rect_filled(
             when,
             CornerRadius::same(FIELD_R),
-            field_fill(main.hovered(), false),
+            field_fill(main.hovered(), has_due),
+        );
+        ui.painter().rect_stroke(
+            when,
+            CornerRadius::same(FIELD_R),
+            Stroke::new(
+                1.0,
+                if has_due {
+                    ACCENT.gamma_multiply(0.5)
+                } else if main.hovered() {
+                    BORDER
+                } else {
+                    Color32::from_rgb(30, 32, 40)
+                },
+            ),
+            StrokeKind::Inside,
         );
         // calendar icon
+        let now_ts = Local::now().timestamp();
+        let (label, col, icon_col) = match self.todo_due {
+            Some(ts) => {
+                let c = if ts <= now_ts { WARN } else { ACCENT };
+                (fmt_due(ts), c, c)
+            }
+            None => ("Date & time".to_string(), DIM, MUTED),
+        };
         {
             let p = ui.painter();
             let ic = pos2(when.left() + 16.0, when.center().y);
@@ -1246,7 +1357,7 @@ impl EmelkaNotch {
             p.rect_stroke(
                 box_r,
                 CornerRadius::same(2),
-                Stroke::new(1.2, MUTED),
+                Stroke::new(1.2, icon_col),
                 StrokeKind::Inside,
             );
             p.line_segment(
@@ -1254,14 +1365,9 @@ impl EmelkaNotch {
                     pos2(box_r.left(), box_r.top() + 3.0),
                     pos2(box_r.right(), box_r.top() + 3.0),
                 ],
-                Stroke::new(1.2, MUTED),
+                Stroke::new(1.2, icon_col),
             );
         }
-        let now_ts = Local::now().timestamp();
-        let (label, col) = match self.todo_due {
-            Some(ts) => (fmt_due(ts), if ts <= now_ts { WARN } else { TEXT }),
-            None => ("Date & time".to_string(), DIM),
-        };
         ui.painter().text(
             pos2(when.left() + 30.0, when.center().y),
             Align2::LEFT_CENTER,
@@ -1327,7 +1433,16 @@ impl EmelkaNotch {
         let today = now.date_naive();
         let (area, _) = ui.allocate_exact_size(vec2(ui.available_width(), 138.0), Sense::hover());
         let p = ui.painter_at(area);
-        let (cw, ch) = (26.0, 16.0);
+        p.rect_filled(area, CornerRadius::same(12), CARD);
+        p.rect_stroke(
+            area,
+            CornerRadius::same(12),
+            Stroke::new(1.0, BORDER),
+            StrokeKind::Inside,
+        );
+
+        let inner = area.shrink2(vec2(10.0, 4.0));
+        let (cw, ch) = (25.0, 15.5);
         let cal_w = cw * 7.0;
         let (year, month) = self.pk_view;
         let Some(first) = NaiveDate::from_ymd_opt(year, month, 1) else {
@@ -1335,12 +1450,22 @@ impl EmelkaNotch {
             return;
         };
 
+        // Vertical divider between calendar and time controls
+        let div_x = inner.left() + cal_w + 12.0;
+        p.line_segment(
+            [
+                pos2(div_x, inner.top() + 4.0),
+                pos2(div_x, inner.bottom() - 4.0),
+            ],
+            Stroke::new(1.0, Color32::from_rgb(28, 30, 38)),
+        );
+
         // ---- calendar header ----
-        let hy = area.top() + 10.0;
+        let hy = inner.top() + 9.0;
         if arrow_btn(
             ui,
             &p,
-            Rect::from_center_size(pos2(area.left() + 10.0, hy), vec2(20.0, 20.0)),
+            Rect::from_center_size(pos2(inner.left() + 10.0, hy), vec2(20.0, 20.0)),
             -1.0,
             "prev",
         ) {
@@ -1353,7 +1478,7 @@ impl EmelkaNotch {
         if arrow_btn(
             ui,
             &p,
-            Rect::from_center_size(pos2(area.left() + cal_w - 10.0, hy), vec2(20.0, 20.0)),
+            Rect::from_center_size(pos2(inner.left() + cal_w - 10.0, hy), vec2(20.0, 20.0)),
             1.0,
             "next",
         ) {
@@ -1364,10 +1489,10 @@ impl EmelkaNotch {
             };
         }
         p.text(
-            pos2(area.left() + cal_w / 2.0, hy),
+            pos2(inner.left() + cal_w / 2.0, hy),
             Align2::CENTER_CENTER,
             first.format("%B %Y").to_string(),
-            semibold(12.0),
+            semibold(11.5),
             TEXT,
         );
         for (i, w) in ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]
@@ -1375,16 +1500,16 @@ impl EmelkaNotch {
             .enumerate()
         {
             p.text(
-                pos2(area.left() + cw * (i as f32 + 0.5), area.top() + 30.0),
+                pos2(inner.left() + cw * (i as f32 + 0.5), inner.top() + 27.0),
                 Align2::CENTER_CENTER,
                 *w,
-                FontId::proportional(10.0),
+                FontId::proportional(9.5),
                 DIM,
             );
         }
 
         // ---- day grid ----
-        let grid_top = area.top() + 40.0;
+        let grid_top = inner.top() + 36.0;
         let offset = first.weekday().num_days_from_monday() as usize;
         for d in 1..=31u32 {
             let Some(date) = NaiveDate::from_ymd_opt(year, month, d) else {
@@ -1393,7 +1518,7 @@ impl EmelkaNotch {
             let idx = offset + d as usize - 1;
             let cell = Rect::from_min_size(
                 pos2(
-                    area.left() + (idx % 7) as f32 * cw,
+                    inner.left() + (idx % 7) as f32 * cw,
                     grid_top + (idx / 7) as f32 * ch,
                 ),
                 vec2(cw, ch),
@@ -1431,7 +1556,7 @@ impl EmelkaNotch {
                 cell.center(),
                 Align2::CENTER_CENTER,
                 d.to_string(),
-                FontId::proportional(11.0),
+                FontId::proportional(10.5),
                 col,
             );
             if resp.map_or(false, |r| r.clicked()) {
@@ -1440,25 +1565,25 @@ impl EmelkaNotch {
         }
 
         // ---- right side: time, quick dates, actions ----
-        let rx = area.left() + cal_w + 28.0;
+        let rx = div_x + 14.0;
         p.text(
-            pos2(rx, area.top() + 8.0),
+            pos2(rx, inner.top() + 7.0),
             Align2::LEFT_CENTER,
-            "Time",
-            FontId::proportional(11.0),
+            "Reminder Time",
+            FontId::proportional(10.5),
             MUTED,
         );
         stepper(
             ui,
             &p,
-            pos2(rx, area.top() + 20.0),
+            pos2(rx, inner.top() + 18.0),
             &mut self.pk_h,
             24,
             1,
             "h",
         );
         p.text(
-            pos2(rx + 96.0 + 8.0, area.top() + 34.0),
+            pos2(rx + 96.0 + 8.0, inner.top() + 32.0),
             Align2::CENTER_CENTER,
             ":",
             semibold(13.0),
@@ -1467,7 +1592,7 @@ impl EmelkaNotch {
         stepper(
             ui,
             &p,
-            pos2(rx + 96.0 + 16.0, area.top() + 20.0),
+            pos2(rx + 96.0 + 16.0, inner.top() + 18.0),
             &mut self.pk_m,
             60,
             5,
@@ -1478,10 +1603,10 @@ impl EmelkaNotch {
         let mut x = rx;
         for (label, w, days) in [
             ("Today", 56.0, 0i64),
-            ("Tomorrow", 76.0, 1),
-            ("Next week", 84.0, 7),
+            ("Tomorrow", 74.0, 1),
+            ("Next week", 82.0, 7),
         ] {
-            let r = Rect::from_min_size(pos2(x, area.top() + 58.0), vec2(w, 24.0));
+            let r = Rect::from_min_size(pos2(x, inner.top() + 56.0), vec2(w, 24.0));
             if text_btn(ui, &p, r, label, label, false, true) {
                 quick = today.checked_add_signed(chrono::Duration::days(days));
             }
@@ -1493,29 +1618,29 @@ impl EmelkaNotch {
         }
 
         // actions
-        let by = area.top() + 104.0;
+        let by = inner.bottom() - 30.0;
         let ts = self.pk_ts();
         let future = ts.map_or(false, |t| t > now.timestamp());
-        let right = area.right();
-        let done = Rect::from_min_size(pos2(right - 72.0, by), vec2(72.0, 28.0));
-        let clear = Rect::from_min_size(pos2(right - 72.0 - 6.0 - 64.0, by), vec2(64.0, 28.0));
+        let right = inner.right();
+        let done = Rect::from_min_size(pos2(right - 68.0, by), vec2(68.0, 26.0));
+        let clear = Rect::from_min_size(pos2(right - 68.0 - 6.0 - 60.0, by), vec2(60.0, 26.0));
         let (sum, sum_col) = match ts {
-            Some(t) if future => (fmt_due(t), TEXT),
+            Some(t) if future => (fmt_due(t), ACCENT),
             Some(_) => ("Time has passed".to_string(), WARN),
             None => (String::new(), TEXT),
         };
         p.text(
-            pos2(rx, by + 14.0),
+            pos2(rx, by + 13.0),
             Align2::LEFT_CENTER,
             sum,
-            FontId::proportional(11.5),
+            FontId::proportional(11.0),
             sum_col,
         );
         if text_btn(ui, &p, clear, "Clear", "clear", false, true) {
             self.todo_due = None;
             self.picker_open = false;
         }
-        if text_btn(ui, &p, done, "Done", "done", true, future) {
+        if text_btn(ui, &p, done, "Set", "done", true, future) {
             self.todo_due = ts;
             self.picker_open = false;
         }
@@ -1558,34 +1683,106 @@ impl EmelkaNotch {
         items.sort_by_key(|t| (t.done, t.due.unwrap_or(i64::MAX), t.id));
 
         if items.is_empty() {
-            ui.add_space(14.0);
-            ui.vertical_centered(|ui| {
-                ui.label(
-                    egui::RichText::new("No tasks yet")
-                        .font(semibold(14.0))
-                        .color(TEXT),
-                );
-                ui.add_space(2.0);
-                ui.label(small(
-                    "Pick a date & time to get a reminder (optional)".into(),
-                ));
-            });
+            let w = ui.available_width();
+            let h = ui.available_height().max(96.0);
+            let (empty_r, p) = card(ui, w, h);
+            let cx = empty_r.center().x;
+            let cy = empty_r.center().y;
+
+            let badge_c = pos2(cx, cy - 18.0);
+            p.circle_filled(badge_c, 13.0, GREEN.gamma_multiply(0.14));
+            p.circle_stroke(badge_c, 13.0, Stroke::new(1.0, GREEN.gamma_multiply(0.35)));
+            let s = Stroke::new(1.7, GREEN);
+            p.line_segment([badge_c + vec2(-4.5, 0.5), badge_c + vec2(-1.2, 3.8)], s);
+            p.line_segment([badge_c + vec2(-1.2, 3.8), badge_c + vec2(5.0, -3.5)], s);
+
+            p.text(
+                pos2(cx, cy + 6.0),
+                Align2::CENTER_CENTER,
+                "All clear — no tasks yet",
+                semibold(12.5),
+                TEXT,
+            );
+            p.text(
+                pos2(cx, cy + 23.0),
+                Align2::CENTER_CENTER,
+                "Type a task above or pick a reminder time",
+                FontId::proportional(11.0),
+                MUTED,
+            );
             return;
         }
 
         let now = Local::now().timestamp();
+        let total = items.len();
+        let done_count = items.iter().filter(|t| t.done).count();
+        let active_count = total.saturating_sub(done_count);
+
+        // ---- Status bar + Clear completed ----
+        let mut clear_done = false;
+        let (head, _) = ui.allocate_exact_size(vec2(ui.available_width(), 18.0), Sense::hover());
+        let dot_col = if active_count == 0 { GREEN } else { ACCENT };
+        ui.painter()
+            .circle_filled(pos2(head.left() + 6.0, head.center().y), 3.0, dot_col);
+        let status_label = if active_count == 0 {
+            format!("All {total} completed")
+        } else if done_count == 0 {
+            format!(
+                "{active_count} pending task{}",
+                if active_count == 1 { "" } else { "s" }
+            )
+        } else {
+            format!("{active_count} pending · {done_count} done")
+        };
+        ui.painter().text(
+            pos2(head.left() + 14.0, head.center().y),
+            Align2::LEFT_CENTER,
+            status_label,
+            FontId::proportional(10.5),
+            MUTED,
+        );
+
+        if done_count > 0 {
+            let label = "Clear done";
+            let gw = text_w(ui.painter(), label, &FontId::proportional(10.5));
+            let btn = Rect::from_min_size(
+                pos2(head.right() - gw - 14.0, head.top() - 1.0),
+                vec2(gw + 14.0, 20.0),
+            );
+            let r = btn_rect(ui, btn, "todo_clear_done");
+            if r.hovered() {
+                ui.painter()
+                    .rect_filled(btn, CornerRadius::same(6), Color32::from_rgb(24, 25, 31));
+            }
+            ui.painter().text(
+                btn.center(),
+                Align2::CENTER_CENTER,
+                label,
+                FontId::proportional(10.5),
+                if r.hovered() { TEXT } else { MUTED },
+            );
+            if r.clicked() {
+                clear_done = true;
+            }
+        }
+
+        ui.add_space(3.0);
+
         let added = self.added;
         let mut toggle: Option<u64> = None;
         let mut delete: Option<u64> = None;
 
         egui::ScrollArea::vertical()
-            .max_height(100.0)
+            .max_height(80.0)
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                ui.spacing_mut().item_spacing.y = 2.0;
+                ui.spacing_mut().item_spacing.y = 4.0;
                 for t in &items {
+                    let row_h = 32.0;
                     let (alloc, resp) =
-                        ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::click());
+                        ui.allocate_exact_size(vec2(ui.available_width(), row_h), Sense::click());
+                    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+
                     // New item: slides in from the right, fades in, and flashes green.
                     let anim = added
                         .filter(|(id, at)| *id == t.id && at.elapsed().as_secs_f32() < 0.45)
@@ -1595,68 +1792,121 @@ impl EmelkaNotch {
                         Some(k) => {
                             let e = ease_out(k);
                             p.set_opacity(e);
-                            p.rect_filled(
-                                alloc,
-                                CornerRadius::same(FIELD_R),
-                                GREEN.gamma_multiply(0.16 * (1.0 - k)),
-                            );
                             ui.scroll_to_rect(alloc, None);
                             alloc.translate(vec2((1.0 - e) * 60.0, 0.0))
                         }
                         None => alloc,
                     };
-                    if resp.hovered() {
+
+                    let overdue = !t.done && t.due.map_or(false, |d| d <= now);
+                    let hovered = resp.hovered();
+                    let row_bg = if hovered {
+                        Color32::from_rgb(21, 23, 30)
+                    } else {
+                        CARD
+                    };
+                    p.rect_filled(rect, CornerRadius::same(8), row_bg);
+
+                    if let Some(k) = anim {
                         p.rect_filled(
                             rect,
-                            CornerRadius::same(FIELD_R),
-                            Color32::from_rgb(20, 21, 27),
+                            CornerRadius::same(8),
+                            GREEN.gamma_multiply(0.18 * (1.0 - k)),
                         );
-                    }
-                    let cy = rect.center().y;
-                    let cc = pos2(rect.left() + 12.0, cy);
-                    if t.done {
-                        p.circle_filled(cc, 7.0, GREEN);
-                        let s = Stroke::new(1.6, BG);
-                        p.line_segment([cc + vec2(-3.0, 0.0), cc + vec2(-1.0, 2.5)], s);
-                        p.line_segment([cc + vec2(-1.0, 2.5), cc + vec2(3.5, -2.5)], s);
-                    } else {
-                        p.circle_stroke(cc, 7.0, Stroke::new(1.5, DIM));
                     }
 
-                    let right = rect.right() - 24.0;
-                    let x = rect.left() + 28.0;
-                    let mut text_max = right - x;
-                    if let Some(d) = t.due {
-                        let overdue = !t.done && d <= now;
-                        let label = fmt_due(d);
-                        let f = FontId::proportional(10.5);
-                        let w = text_w(&p, &label, &f);
-                        p.text(
-                            pos2(right, cy),
-                            Align2::RIGHT_CENTER,
-                            label,
-                            f,
-                            if overdue { WARN } else { MUTED },
-                        );
-                        text_max -= w + 10.0;
+                    let border_col = if overdue {
+                        WARN.gamma_multiply(if hovered { 0.55 } else { 0.35 })
+                    } else if hovered {
+                        BORDER
+                    } else {
+                        Color32::from_rgb(26, 28, 36)
+                    };
+                    p.rect_stroke(
+                        rect,
+                        CornerRadius::same(8),
+                        Stroke::new(1.0, border_col),
+                        StrokeKind::Inside,
+                    );
+
+                    let cy = rect.center().y;
+                    let cc = pos2(rect.left() + 15.0, cy);
+                    if t.done {
+                        p.circle_filled(cc, 7.5, GREEN);
+                        let s = Stroke::new(1.6, BG);
+                        p.line_segment([cc + vec2(-3.0, 0.0), cc + vec2(-0.8, 2.4)], s);
+                        p.line_segment([cc + vec2(-0.8, 2.4), cc + vec2(3.5, -2.5)], s);
+                    } else {
+                        let ring_col = if hovered { ACCENT } else { MUTED };
+                        p.circle_filled(cc, 7.5, Color32::from_rgb(10, 11, 15));
+                        p.circle_stroke(cc, 7.5, Stroke::new(1.5, ring_col));
                     }
-                    let f = FontId::proportional(12.0);
-                    let (txt, tw) = fit(&p, &one_line(&t.text), f.clone(), text_max.max(30.0));
+
+                    let right_pad = if hovered { 30.0 } else { 10.0 };
+                    let mut right_edge = rect.right() - right_pad;
+                    let x = rect.left() + 32.0;
+
+                    if let Some(d) = t.due {
+                        let label = fmt_due(d);
+                        let f = FontId::proportional(10.0);
+                        let tw = text_w(&p, &label, &f);
+                        let pill_w = tw + 12.0;
+                        let pill_h = 18.0;
+                        let pill_r = Rect::from_min_size(
+                            pos2(right_edge - pill_w, cy - pill_h / 2.0),
+                            vec2(pill_w, pill_h),
+                        );
+                        let (bg_c, fg_c) = if t.done {
+                            (Color32::from_rgb(24, 26, 33), DIM)
+                        } else if overdue {
+                            (WARN.gamma_multiply(0.16), WARN)
+                        } else {
+                            (ACCENT.gamma_multiply(0.14), ACCENT)
+                        };
+                        p.rect_filled(pill_r, CornerRadius::same(5), bg_c);
+                        p.text(pill_r.center(), Align2::CENTER_CENTER, label, f, fg_c);
+                        right_edge = pill_r.left() - 8.0;
+                    }
+
+                    let text_max = (right_edge - x).max(30.0);
+                    let f = if t.done {
+                        FontId::proportional(12.0)
+                    } else {
+                        semibold(12.0)
+                    };
+                    let (txt, tw) = fit(&p, &one_line(&t.text), f.clone(), text_max);
                     let col = if t.done { DIM } else { TEXT };
                     p.text(pos2(x, cy), Align2::LEFT_CENTER, txt, f, col);
                     if t.done {
-                        p.line_segment([pos2(x, cy), pos2(x + tw, cy)], Stroke::new(1.0, DIM));
+                        p.line_segment(
+                            [pos2(x, cy), pos2(x + tw, cy)],
+                            Stroke::new(1.0, MUTED.gamma_multiply(0.6)),
+                        );
                     }
 
-                    if resp.hovered() {
-                        let c = pos2(rect.right() - 11.0, cy);
-                        let s = Stroke::new(1.3, MUTED);
-                        p.line_segment([c + vec2(-3.5, -3.5), c + vec2(3.5, 3.5)], s);
-                        p.line_segment([c + vec2(-3.5, 3.5), c + vec2(3.5, -3.5)], s);
+                    if hovered {
+                        let del_rect =
+                            Rect::from_center_size(pos2(rect.right() - 15.0, cy), vec2(20.0, 20.0));
+                        let ptr_in_del = resp
+                            .interact_pointer_pos()
+                            .or_else(|| ui.input(|i| i.pointer.hover_pos()))
+                            .map_or(false, |pt| del_rect.contains(pt));
+                        if ptr_in_del {
+                            p.rect_filled(
+                                del_rect,
+                                CornerRadius::same(5),
+                                WARN.gamma_multiply(0.18),
+                            );
+                        }
+                        let c = del_rect.center();
+                        let s = Stroke::new(1.3, if ptr_in_del { WARN } else { MUTED });
+                        p.line_segment([c + vec2(-3.2, -3.2), c + vec2(3.2, 3.2)], s);
+                        p.line_segment([c + vec2(-3.2, 3.2), c + vec2(3.2, -3.2)], s);
                     }
+
                     if resp.clicked() {
                         if let Some(pos) = resp.interact_pointer_pos() {
-                            if pos.x > rect.right() - 24.0 {
+                            if pos.x > rect.right() - 28.0 {
                                 delete = Some(t.id);
                             } else {
                                 toggle = Some(t.id);
@@ -1666,8 +1916,11 @@ impl EmelkaNotch {
                 }
             });
 
-        if toggle.is_some() || delete.is_some() {
+        if toggle.is_some() || delete.is_some() || clear_done {
             let mut st = self.todos.lock().unwrap();
+            if clear_done {
+                st.items.retain(|t| !t.done);
+            }
             if let Some(id) = toggle {
                 if let Some(t) = st.items.iter_mut().find(|t| t.id == id) {
                     t.done = !t.done;
@@ -1688,12 +1941,21 @@ impl EmelkaNotch {
             crate::weather::draw_weather_panel(ui, &st)
         };
         if retry {
-            self.weather.lock().unwrap().retry = true;
+            {
+                let mut w = self.weather.lock().unwrap();
+                w.retry = true;
+                w.status = crate::weather::WeatherStatus::Locating;
+            }
+            {
+                let mut p = self.prayer.lock().unwrap();
+                p.retry = true;
+                p.status = crate::prayer::PrayerStatus::Locating;
+            }
         }
     }
 
     pub(crate) fn antigravity_section(&mut self, ui: &mut Ui) {
-        ui.spacing_mut().item_spacing.y = 6.0;
+        ui.spacing_mut().item_spacing.y = 8.0;
 
         let (status, quota, is_loading) = {
             let st = self.antigravity.lock().unwrap();
@@ -1703,21 +1965,35 @@ impl EmelkaNotch {
         let w = ui.available_width();
 
         if let Some(q) = quota {
-            // 1. Header card
-            let h_head = 54.0;
+            // 1. Compact Header Card (42px)
+            let h_head = 42.0;
             let (r_head, p_head) = card(ui, w, h_head);
 
+            // Sparkle diamond badge on left
+            let ic = pos2(r_head.left() + 18.0, r_head.center().y);
+            p_head.circle_filled(ic, 10.0, ACCENT.gamma_multiply(0.14));
+            let pts = vec![
+                pos2(ic.x, ic.y - 4.8),
+                pos2(ic.x + 3.8, ic.y),
+                pos2(ic.x, ic.y + 4.8),
+                pos2(ic.x - 3.8, ic.y),
+            ];
+            p_head.add(egui::Shape::closed_line(pts, Stroke::new(1.3, ACCENT)));
+
+            let title_font = semibold(13.0);
+            let title_x = r_head.left() + 34.0;
             p_head.text(
-                pos2(r_head.left() + 14.0, r_head.top() + 18.0),
+                pos2(title_x, r_head.center().y),
                 Align2::LEFT_CENTER,
                 "Models & Quota",
-                semibold(14.0),
+                title_font.clone(),
                 TEXT,
             );
+            let title_w = text_w(&p_head, "Models & Quota", &title_font);
 
-            let acc_text = format!("Account: {}", q.account);
+            let acc_text = format!("·  {}", q.account);
             p_head.text(
-                pos2(r_head.left() + 14.0, r_head.top() + 38.0),
+                pos2(title_x + title_w + 8.0, r_head.center().y),
                 Align2::LEFT_CENTER,
                 &acc_text,
                 FontId::proportional(11.0),
@@ -1729,7 +2005,7 @@ impl EmelkaNotch {
             let btn_h = 24.0;
             let r_logout = Rect::from_min_size(
                 pos2(
-                    r_head.right() - btn_w - 12.0,
+                    r_head.right() - btn_w - 10.0,
                     r_head.center().y - btn_h / 2.0,
                 ),
                 vec2(btn_w, btn_h),
@@ -1739,8 +2015,8 @@ impl EmelkaNotch {
             }
 
             let r_refresh = Rect::from_min_size(
-                pos2(r_logout.left() - 32.0, r_head.center().y - btn_h / 2.0),
-                vec2(26.0, btn_h),
+                pos2(r_logout.left() - 30.0, r_head.center().y - btn_h / 2.0),
+                vec2(24.0, btn_h),
             );
             let ref_label = if is_loading { "…" } else { "↻" };
             if text_btn(
@@ -1755,89 +2031,209 @@ impl EmelkaNotch {
                 self.antigravity.lock().unwrap().trigger_refresh = true;
             }
 
-            // 2. Scrollable Quota Groups Card
-            let h_body = (ui.available_height() - 4.0).max(180.0);
-            let (r_body, _) = card(ui, w, h_body);
+            // Helper to clean up verbose descriptions and bucket labels
+            let clean_desc = |d: &str| -> String {
+                d.trim_start_matches("Models within this group: ")
+                    .trim()
+                    .to_string()
+            };
+            let clean_bucket = |name: &str| -> String {
+                if name.contains("Five Hour") {
+                    "5-Hour Limit".to_string()
+                } else if name.contains("Argon Weekly") {
+                    "Weekly Limit".to_string()
+                } else if name.contains("Weekly Limit") {
+                    "Weekly Limit".to_string()
+                } else {
+                    name.to_string()
+                }
+            };
 
-            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(r_body.shrink(10.0)));
+            // 2. Top Row: 2 Side-by-Side Bento Cards (Gemini Models & Claude/GPT Models)
+            let gap = 8.0;
+            let col_w = (w - gap) / 2.0;
+            let top_h = 152.0;
+            let (row_rect, _) = ui.allocate_exact_size(vec2(w, top_h), Sense::hover());
 
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show(&mut child, |ui| {
-                    ui.spacing_mut().item_spacing.y = 8.0;
+            for idx in 0..2 {
+                let Some(group) = q.groups.get(idx) else {
+                    continue;
+                };
+                let c_rect = Rect::from_min_size(
+                    pos2(row_rect.left() + idx as f32 * (col_w + gap), row_rect.top()),
+                    vec2(col_w, top_h),
+                );
+                let p = ui.painter_at(c_rect);
+                p.rect_filled(c_rect, CornerRadius::same(12), CARD);
+                p.rect_stroke(
+                    c_rect,
+                    CornerRadius::same(12),
+                    Stroke::new(1.0, BORDER),
+                    StrokeKind::Inside,
+                );
 
-                    for group in &q.groups {
-                        ui.add_space(2.0);
-                        ui.label(
-                            egui::RichText::new(group.name.to_uppercase())
-                                .font(semibold(11.5))
-                                .color(TEXT),
+                let pad = 12.0;
+                let left = c_rect.left() + pad;
+                let right = c_rect.right() - pad;
+                let top = c_rect.top();
+
+                let dot_col = if idx == 0 { ACCENT } else { PURPLE };
+                p.circle_filled(pos2(left + 3.5, top + 16.0), 3.0, dot_col);
+                p.text(
+                    pos2(left + 11.0, top + 16.0),
+                    Align2::LEFT_CENTER,
+                    group.name.to_uppercase(),
+                    semibold(11.0),
+                    TEXT,
+                );
+
+                let desc = clean_desc(&group.description);
+                let (desc_fit, _) = fit(&p, &desc, FontId::proportional(10.0), right - left);
+                p.text(
+                    pos2(left, top + 31.0),
+                    Align2::LEFT_CENTER,
+                    desc_fit,
+                    FontId::proportional(10.0),
+                    MUTED,
+                );
+
+                p.line_segment(
+                    [pos2(left, top + 43.0), pos2(right, top + 43.0)],
+                    Stroke::new(1.0, Color32::from_rgb(26, 28, 36)),
+                );
+
+                for (b_idx, bucket) in group.buckets.iter().take(2).enumerate() {
+                    let by = top + 55.0 + b_idx as f32 * 49.0;
+                    let pct = (bucket.remaining_fraction * 100.0).clamp(0.0, 100.0);
+                    let pct_str = format!("{:.2}%", pct);
+                    let bar_col = if pct < 20.0 { WARN } else { GREEN };
+
+                    p.text(
+                        pos2(left, by),
+                        Align2::LEFT_CENTER,
+                        clean_bucket(&bucket.name),
+                        semibold(11.0),
+                        TEXT,
+                    );
+                    p.text(
+                        pos2(right, by),
+                        Align2::RIGHT_CENTER,
+                        &pct_str,
+                        semibold(11.0),
+                        bar_col,
+                    );
+
+                    let bar_rect =
+                        Rect::from_min_size(pos2(left, by + 9.0), vec2(right - left, 6.0));
+                    p.rect_filled(bar_rect, CornerRadius::same(3), TRACK);
+                    if bucket.remaining_fraction > 0.0 {
+                        let fw = bar_rect.width() * bucket.remaining_fraction.clamp(0.0, 1.0);
+                        p.rect_filled(
+                            Rect::from_min_size(bar_rect.min, vec2(fw, 6.0)),
+                            CornerRadius::same(3),
+                            bar_col,
                         );
-
-                        if !group.description.is_empty() {
-                            ui.label(
-                                egui::RichText::new(&group.description)
-                                    .font(FontId::proportional(10.0))
-                                    .color(MUTED),
-                            );
-                        }
-
-                        for bucket in &group.buckets {
-                            ui.add_space(2.0);
-                            let pct = (bucket.remaining_fraction * 100.0).clamp(0.0, 100.0);
-                            let pct_str = format!("{:.2}%", pct);
-
-                            // Title row: Bucket name & percentage
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    egui::RichText::new(&bucket.name)
-                                        .font(semibold(11.0))
-                                        .color(TEXT),
-                                );
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        ui.label(
-                                            egui::RichText::new(&pct_str)
-                                                .font(semibold(11.5))
-                                                .color(TEXT),
-                                        );
-                                    },
-                                );
-                            });
-
-                            // Progress bar
-                            let bar_h = 7.0;
-                            let (bar_rect, _) = ui.allocate_exact_size(
-                                vec2(ui.available_width(), bar_h),
-                                Sense::hover(),
-                            );
-                            let p_bar = ui.painter();
-                            p_bar.rect_filled(bar_rect, CornerRadius::same(3), TRACK);
-
-                            if bucket.remaining_fraction > 0.0 {
-                                let fill_w = bar_rect.width() * bucket.remaining_fraction.min(1.0);
-                                let fill_rect =
-                                    Rect::from_min_size(bar_rect.min, vec2(fill_w, bar_h));
-                                let fill_col = if pct < 20.0 { WARN } else { GREEN };
-                                p_bar.rect_filled(fill_rect, CornerRadius::same(3), fill_col);
-                            }
-
-                            // Reset subtitle (e.g. "Refreshes in 167h 23m" or "Quota available")
-                            let reset_str = crate::antigravity::format_reset_info(
-                                bucket.reset_time.as_deref(),
-                                bucket.remaining_fraction,
-                            );
-                            ui.label(
-                                egui::RichText::new(reset_str)
-                                    .font(FontId::proportional(10.0))
-                                    .color(GREEN),
-                            );
-                        }
-
-                        ui.add_space(6.0);
                     }
-                });
+
+                    let reset_str = crate::antigravity::format_reset_info(
+                        bucket.reset_time.as_deref(),
+                        bucket.remaining_fraction,
+                    );
+                    let reset_col = if reset_str == "Quota available" {
+                        GREEN.gamma_multiply(0.85)
+                    } else {
+                        MUTED
+                    };
+                    let (r_fit, _) = fit(&p, &reset_str, FontId::proportional(9.5), right - left);
+                    p.text(
+                        pos2(left, by + 24.0),
+                        Align2::LEFT_CENTER,
+                        r_fit,
+                        FontId::proportional(9.5),
+                        reset_col,
+                    );
+                }
+            }
+
+            // 3. Bottom Row: Full-Width Card for 3rd Group (Gemini 4 Argon)
+            if let Some(group) = q.groups.get(2) {
+                let bot_h = ui.available_height().max(74.0);
+                let (b_rect, p) = card(ui, w, bot_h);
+                let pad = 12.0;
+                let left = b_rect.left() + pad;
+                let right = b_rect.right() - pad;
+                let top = b_rect.top();
+
+                p.circle_filled(pos2(left + 3.5, top + 17.0), 3.0, GREEN);
+                let g_title = group.name.to_uppercase();
+                let g_font = semibold(11.0);
+                p.text(
+                    pos2(left + 11.0, top + 17.0),
+                    Align2::LEFT_CENTER,
+                    &g_title,
+                    g_font.clone(),
+                    TEXT,
+                );
+                let gw = text_w(&p, &g_title, &g_font);
+
+                p.text(
+                    pos2(left + 11.0 + gw + 8.0, top + 17.0),
+                    Align2::LEFT_CENTER,
+                    "·  Separate Pro / Ultra plan quota",
+                    FontId::proportional(10.0),
+                    MUTED,
+                );
+
+                if let Some(bucket) = group.buckets.first() {
+                    let pct = (bucket.remaining_fraction * 100.0).clamp(0.0, 100.0);
+                    let pct_str = format!("{:.2}%", pct);
+                    let bar_col = if pct < 20.0 { WARN } else { GREEN };
+
+                    p.text(
+                        pos2(right, top + 17.0),
+                        Align2::RIGHT_CENTER,
+                        &pct_str,
+                        semibold(11.5),
+                        bar_col,
+                    );
+
+                    let bar_y = b_rect.center().y - 2.0;
+                    let bar_rect = Rect::from_min_size(pos2(left, bar_y), vec2(right - left, 6.5));
+                    p.rect_filled(bar_rect, CornerRadius::same(3), TRACK);
+                    if bucket.remaining_fraction > 0.0 {
+                        let fw = bar_rect.width() * bucket.remaining_fraction.clamp(0.0, 1.0);
+                        p.rect_filled(
+                            Rect::from_min_size(bar_rect.min, vec2(fw, 6.5)),
+                            CornerRadius::same(3),
+                            bar_col,
+                        );
+                    }
+
+                    let reset_str = crate::antigravity::format_reset_info(
+                        bucket.reset_time.as_deref(),
+                        bucket.remaining_fraction,
+                    );
+                    let bot_y = b_rect.bottom() - 16.0;
+                    p.text(
+                        pos2(left, bot_y),
+                        Align2::LEFT_CENTER,
+                        &bucket.name,
+                        FontId::proportional(10.5),
+                        MUTED,
+                    );
+                    p.text(
+                        pos2(right, bot_y),
+                        Align2::RIGHT_CENTER,
+                        reset_str,
+                        FontId::proportional(10.0),
+                        if pct >= 99.95 {
+                            GREEN.gamma_multiply(0.85)
+                        } else {
+                            MUTED
+                        },
+                    );
+                }
+            }
         } else {
             match status {
                 AuthStatus::Authenticating { port } => {

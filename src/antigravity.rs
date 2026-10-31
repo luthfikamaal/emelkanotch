@@ -107,7 +107,9 @@ pub(crate) fn format_reset_info(reset_time: Option<&str>, fraction: f32) -> Stri
             if duration.num_seconds() > 0 {
                 let total_hours = duration.num_hours();
                 let mins = (duration.num_minutes() % 60).max(0);
-                return format!("Refreshes in {}h {}m", total_hours, mins);
+                let local_dt = dt.with_timezone(&Local);
+                let dt_str = local_dt.format("%d %b, %H:%M").to_string();
+                return format!("Refreshes in {}h {}m ({})", total_hours, mins, dt_str);
             }
         }
     }

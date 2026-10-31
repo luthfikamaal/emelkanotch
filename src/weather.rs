@@ -134,7 +134,7 @@ fn num(v: &serde_json::Value) -> f32 {
 }
 
 fn parse_forecast(v: &serde_json::Value) -> Result<Parsed, String> {
-    let bad = || "Format cuaca tidak dikenali".to_string();
+    let bad = || "Unrecognized weather format".to_string();
 
     let cur = v.get("current").ok_or_else(bad)?;
     let g = |k: &str| cur.get(k).map_or(0.0, num);
@@ -178,7 +178,7 @@ fn parse_forecast(v: &serde_json::Value) -> Result<Parsed, String> {
     hours.truncate(72);
 
     if hours.is_empty() {
-        return Err("Data cuaca kosong dari server".into());
+        return Err("Empty weather data from server".into());
     }
     Ok((now, hours))
 }
@@ -187,22 +187,22 @@ fn parse_forecast(v: &serde_json::Value) -> Result<Parsed, String> {
 
 fn weather_desc(code: u8) -> &'static str {
     match code {
-        0 => "Cerah",
-        1 => "Cerah berawan",
-        2 => "Berawan sebagian",
-        3 => "Mendung",
-        45 | 48 => "Berkabut",
-        51 | 53 | 55 => "Gerimis",
-        56 | 57 => "Gerimis beku",
-        61 | 63 | 65 => "Hujan",
-        66 | 67 => "Hujan beku",
-        71 | 73 | 75 => "Salju",
-        77 => "Butir salju",
-        80 | 81 | 82 => "Hujan lokal",
-        85 | 86 => "Hujan salju",
-        95 => "Badai petir",
-        96 | 99 => "Badai es",
-        _ => "Berawan",
+        0 => "Clear",
+        1 => "Mostly Clear",
+        2 => "Partly Cloudy",
+        3 => "Overcast",
+        45 | 48 => "Foggy",
+        51 | 53 | 55 => "Drizzle",
+        56 | 57 => "Freezing Drizzle",
+        61 | 63 | 65 => "Rain",
+        66 | 67 => "Freezing Rain",
+        71 | 73 | 75 => "Snow",
+        77 => "Snow Grains",
+        80 | 81 | 82 => "Rain Showers",
+        85 | 86 => "Snow Showers",
+        95 => "Thunderstorm",
+        96 | 99 => "Hailstorm",
+        _ => "Cloudy",
     }
 }
 
@@ -237,14 +237,14 @@ fn month_short(m: u32) -> &'static str {
         2 => "Feb",
         3 => "Mar",
         4 => "Apr",
-        5 => "Mei",
+        5 => "May",
         6 => "Jun",
         7 => "Jul",
-        8 => "Agu",
+        8 => "Aug",
         9 => "Sep",
-        10 => "Okt",
+        10 => "Oct",
         11 => "Nov",
-        _ => "Des",
+        _ => "Dec",
     }
 }
 
@@ -455,18 +455,18 @@ pub(crate) fn draw_weather_panel(ui: &mut egui::Ui, s: &WeatherState) -> bool {
         ui.vertical_centered(|ui| {
             let (title, sub, failed) = match &s.status {
                 WeatherStatus::Locating => (
-                    "Mendeteksi lokasi…".to_string(),
-                    "Memakai lokasi perangkat, fallback ke IP".to_string(),
+                    "Detecting location…".to_string(),
+                    "Using device location, IP fallback".to_string(),
                     false,
                 ),
                 WeatherStatus::Error(e) => (
-                    "Cuaca belum tersedia".to_string(),
+                    "Weather unavailable".to_string(),
                     crate::theme::ellipsize(e, 70),
                     true,
                 ),
                 _ => (
-                    "Memuat cuaca…".to_string(),
-                    "Sumber: open-meteo.com".to_string(),
+                    "Loading weather…".to_string(),
+                    "Source: open-meteo.com".to_string(),
                     false,
                 ),
             };
@@ -481,7 +481,7 @@ pub(crate) fn draw_weather_panel(ui: &mut egui::Ui, s: &WeatherState) -> bool {
                 ui.add_space(8.0);
                 let (r, _) = ui.allocate_exact_size(vec2(92.0, 26.0), Sense::hover());
                 let p = ui.painter().clone();
-                if crate::ui::text_btn(ui, &p, r, "Coba lagi", "wx_retry", true, true) {
+                if crate::ui::text_btn(ui, &p, r, "Retry", "wx_retry", true, true) {
                     retry = true;
                 }
             }
@@ -506,7 +506,7 @@ pub(crate) fn draw_weather_panel(ui: &mut egui::Ui, s: &WeatherState) -> bool {
         .collect();
     let col = weather_color(now_w.code, now_w.is_day);
 
-    // ================= satu kartu: hero + forecast =================
+    // ================= single card: hero + forecast =================
     ui.add_space(4.0);
     let (card, _) = ui.allocate_exact_size(vec2(w, H_CARD), Sense::hover());
     let p = ui.painter();
@@ -522,7 +522,7 @@ pub(crate) fn draw_weather_panel(ui: &mut egui::Ui, s: &WeatherState) -> bool {
     let top = card.top();
     let right = card.right() - PAD;
 
-    // --- hero kiri: suhu / kondisi / lokasi ---
+    // --- hero left: temp / condition / location ---
     let temp_txt = format!("{:.0}°", now_w.temp);
     let temp_font = FontId::proportional(48.0);
     p.text(
@@ -543,18 +543,23 @@ pub(crate) fn draw_weather_panel(ui: &mut egui::Ui, s: &WeatherState) -> bool {
     p.text(
         pos2(left, top + 72.0),
         Align2::LEFT_CENTER,
-        format!("{} · terasa {:.0}°", weather_desc(now_w.code), now_w.feels),
+        format!(
+            "{} · Feels like {:.0}°",
+            weather_desc(now_w.code),
+            now_w.feels
+        ),
         FontId::proportional(13.0),
         bright,
     );
 
+    let is_updating = matches!(s.status, WeatherStatus::Locating | WeatherStatus::Loading);
+    let raw_place = if is_updating {
+        "Locating…"
+    } else {
+        s.place.trim_start_matches("Kota ")
+    };
     let loc_font = FontId::proportional(11.0);
-    let (place, place_w) = crate::theme::fit(
-        p,
-        s.place.trim_start_matches("Kota "),
-        loc_font.clone(),
-        240.0,
-    );
+    let (place, place_w) = crate::theme::fit(p, raw_place, loc_font.clone(), 240.0);
     let row_y = top + 96.0;
     p.circle_filled(pos2(left + 2.5, row_y), 2.4, rain);
     p.text(
@@ -562,22 +567,24 @@ pub(crate) fn draw_weather_panel(ui: &mut egui::Ui, s: &WeatherState) -> bool {
         Align2::LEFT_CENTER,
         &place,
         loc_font,
-        bright,
+        if is_updating { rain } else { bright },
     );
-    if let Some(u) = s.updated {
-        p.text(
-            pos2(left + 10.0 + place_w + 6.0, row_y),
-            Align2::LEFT_CENTER,
-            format!("· {:02}:{:02}", u.hour(), u.minute()),
-            FontId::proportional(10.0),
-            dim,
-        );
+    if !is_updating {
+        if let Some(u) = s.updated {
+            p.text(
+                pos2(left + 10.0 + place_w + 6.0, row_y),
+                Align2::LEFT_CENTER,
+                format!("· {:02}:{:02}", u.hour(), u.minute()),
+                FontId::proportional(10.0),
+                dim,
+            );
+        }
     }
 
-    // --- hero kanan: ikon besar + angin/kelembapan ---
+    // --- hero right: large icon + wind/humidity ---
     let stat_font = FontId::proportional(10.5);
     let hum_s = format!("{}%", now_w.humidity);
-    let wind_s = format!("{:.0} km/j", now_w.wind);
+    let wind_s = format!("{:.0} km/h", now_w.wind);
     let hw = crate::theme::text_w(p, &hum_s, &stat_font);
     let ww = crate::theme::text_w(p, &wind_s, &stat_font);
     let hum_tx = right - hw;
@@ -618,12 +625,12 @@ pub(crate) fn draw_weather_panel(ui: &mut egui::Ui, s: &WeatherState) -> bool {
     let resp = ui
         .interact(place_rect, ui.id().with("wx_place"), Sense::click())
         .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .on_hover_text("Klik untuk deteksi ulang lokasi & refresh");
+        .on_hover_text("Click to re-detect location & refresh");
     if resp.clicked() {
         retry = true;
     }
 
-    // --- pemisah + judul forecast ---
+    // --- divider + forecast header ---
     p.line_segment(
         [
             pos2(card.left() + PAD, top + HEAD_Y - 6.0),
@@ -641,7 +648,7 @@ pub(crate) fn draw_weather_panel(ui: &mut egui::Ui, s: &WeatherState) -> bool {
     p.text(
         pos2(card.right() - PAD, top + HEAD_Y + 8.0),
         Align2::RIGHT_CENTER,
-        format!("Hari ini · {} {}", now.day(), month_short(now.month())),
+        format!("Today · {} {}", now.day(), month_short(now.month())),
         FontId::proportional(10.0),
         dim,
     );
@@ -768,7 +775,9 @@ pub(crate) fn spawn_weather_worker(ctx: egui::Context, st: Arc<Mutex<WeatherStat
                 match win_coords().or_else(ip_coords) {
                     Some((lat, lon)) => {
                         last_loc_check = Some(Instant::now());
-                        let place = if force || cached_place.is_empty() {
+                        let moved =
+                            (lat - cached_lat).abs() > 0.01 || (lon - cached_lon).abs() > 0.01;
+                        let place = if force || cached_place.is_empty() || moved {
                             reverse_geocode(lat, lon)
                                 .ok()
                                 .and_then(|(state, cands)| {
@@ -776,7 +785,7 @@ pub(crate) fn spawn_weather_worker(ctx: egui::Context, st: Arc<Mutex<WeatherStat
                                 })
                                 .unwrap_or_else(|| {
                                     if cached_place.is_empty() {
-                                        "Lokasi saat ini".to_string()
+                                        "Current location".to_string()
                                     } else {
                                         cached_place.clone()
                                     }
@@ -796,13 +805,13 @@ pub(crate) fn spawn_weather_worker(ctx: egui::Context, st: Arc<Mutex<WeatherStat
                     }
                     None if have_loc => {
                         last_loc_check = Some(Instant::now());
+                        st.lock().unwrap().status = WeatherStatus::Ready;
                         (cached_lat, cached_lon)
                     }
                     None => {
                         {
                             let mut s = st.lock().unwrap();
-                            s.status =
-                                WeatherStatus::Error("Lokasi perangkat tidak tersedia".into());
+                            s.status = WeatherStatus::Error("Device location unavailable".into());
                         }
                         ctx.request_repaint();
                         wait_retry(&st, 30);

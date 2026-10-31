@@ -14,7 +14,7 @@ use crate::notification::{push_notice, NotifState};
 use crate::theme::UA;
 
 pub(crate) const PRAYER_NAMES: [&str; 8] = [
-    "Imsak", "Subuh", "Terbit", "Dhuha", "Dzuhur", "Ashar", "Maghrib", "Isya",
+    "Imsak", "Fajr", "Sunrise", "Dhuha", "Dhuhr", "Asr", "Maghrib", "Isha",
 ];
 pub(crate) const MAIN_PRAYERS: [usize; 5] = [1, 4, 5, 6, 7];
 
@@ -130,16 +130,16 @@ pub(crate) fn fmt_hm(m: u32) -> String {
     format!("{:02}:{:02}", (m / 60) % 24, m % 60)
 }
 
-/// "1j 23m" kalau >= 1 jam, selain itu "12m 05d".
+/// "1h 23m" if >= 1 hour, otherwise "12m 05s".
 #[allow(dead_code)]
 pub(crate) fn fmt_countdown(secs: u32) -> String {
     let h = secs / 3600;
     let m = (secs % 3600) / 60;
     let s = secs % 60;
     if h > 0 {
-        format!("{}j {:02}m", h, m)
+        format!("{}h {:02}m", h, m)
     } else {
-        format!("{}m {:02}d", m, s)
+        format!("{}m {:02}s", m, s)
     }
 }
 
@@ -190,7 +190,7 @@ fn fetch_month(prov: &str, kab: &str, year: i32, month: u32) -> Result<Vec<Praye
         .get("data")
         .and_then(|d| d.get("jadwal"))
         .and_then(|j| j.as_array())
-        .ok_or("Format jadwal tidak dikenali")?;
+        .ok_or("Unrecognized schedule format")?;
     let keys = [
         "imsak", "subuh", "terbit", "dhuha", "dzuhur", "ashar", "maghrib", "isya",
     ];
@@ -219,7 +219,7 @@ fn fetch_month(prov: &str, kab: &str, year: i32, month: u32) -> Result<Vec<Praye
         }
     }
     if out.is_empty() {
-        Err("Jadwal kosong dari server".into())
+        Err("Empty schedule from server".into())
     } else {
         Ok(out)
     }
@@ -234,11 +234,11 @@ pub(crate) fn win_coords() -> Option<(f64, f64)> {
     let pos = g
         .GetGeopositionAsyncWithAgeAndTimeout(
             TimeSpan {
-                Duration: 30 * 60 * 10_000_000,
-            }, // cache boleh sampai 30 menit
+                Duration: 5 * 60 * 10_000_000,
+            }, // max cache age 5 minutes for fresh location updates
             TimeSpan {
                 Duration: 10 * 10_000_000,
-            }, // timeout 10 detik
+            }, // timeout 10 seconds
         )
         .ok()?
         .get()
@@ -261,11 +261,68 @@ pub(crate) fn ip_coords() -> Option<(f64, f64)> {
     Some((v.get("latitude")?.as_f64()?, v.get("longitude")?.as_f64()?))
 }
 
-/// (provinsi, kandidat kab/kota + apakah "kota"(true) / "kabupaten"(false) / tidak diketahui)
+fn iso_to_province(code: &str) -> Option<&'static str> {
+    match code {
+        "ID-AC" => Some("Aceh"),
+        "ID-SU" => Some("Sumatera Utara"),
+        "ID-SB" => Some("Sumatera Barat"),
+        "ID-RI" => Some("Riau"),
+        "ID-KR" => Some("Kepulauan Riau"),
+        "ID-JA" => Some("Jambi"),
+        "ID-SS" => Some("Sumatera Selatan"),
+        "ID-BB" => Some("Kepulauan Bangka Belitung"),
+        "ID-BE" => Some("Bengkulu"),
+        "ID-LA" => Some("Lampung"),
+        "ID-JK" => Some("DKI Jakarta"),
+        "ID-JB" => Some("Jawa Barat"),
+        "ID-BT" => Some("Banten"),
+        "ID-JT" => Some("Jawa Tengah"),
+        "ID-YO" => Some("D.I. Yogyakarta"),
+        "ID-JI" => Some("Jawa Timur"),
+        "ID-BA" => Some("Bali"),
+        "ID-NB" => Some("Nusa Tenggara Barat"),
+        "ID-NT" => Some("Nusa Tenggara Timur"),
+        "ID-KB" => Some("Kalimantan Barat"),
+        "ID-KT" => Some("Kalimantan Tengah"),
+        "ID-KS" => Some("Kalimantan Selatan"),
+        "ID-KI" => Some("Kalimantan Timur"),
+        "ID-KU" => Some("Kalimantan Utara"),
+        "ID-SA" => Some("Sulawesi Utara"),
+        "ID-GO" => Some("Gorontalo"),
+        "ID-ST" => Some("Sulawesi Tengah"),
+        "ID-SR" => Some("Sulawesi Barat"),
+        "ID-SN" => Some("Sulawesi Selatan"),
+        "ID-SG" => Some("Sulawesi Tenggara"),
+        "ID-MA" => Some("Maluku"),
+        "ID-MU" => Some("Maluku Utara"),
+        "ID-PA" => Some("Papua"),
+        "ID-PB" => Some("Papua Barat"),
+        "ID-PS" => Some("Papua Selatan"),
+        "ID-PT" => Some("Papua Tengah"),
+        "ID-PP" => Some("Papua Pegunungan"),
+        "ID-PD" => Some("Papua Barat Daya"),
+        _ => None,
+    }
+}
+
+static GEO_CACHE: Mutex<Option<(f64, f64, Instant, (String, Vec<(String, Option<bool>)>))>> =
+    Mutex::new(None);
+
+/// (province, candidate kab/kota + whether "kota"(true) / "kabupaten"(false) / unknown)
 pub(crate) fn reverse_geocode(
     lat: f64,
     lon: f64,
 ) -> Result<(String, Vec<(String, Option<bool>)>), String> {
+    let mut guard = GEO_CACHE.lock().unwrap();
+    if let Some((clat, clon, at, ref cached)) = *guard {
+        if (clat - lat).abs() < 0.005
+            && (clon - lon).abs() < 0.005
+            && at.elapsed() < Duration::from_secs(10)
+        {
+            return Ok(cached.clone());
+        }
+    }
+
     let v: serde_json::Value = ureq::get("https://nominatim.openstreetmap.org/reverse")
         .set("User-Agent", UA)
         .set("Accept-Language", "id")
@@ -279,14 +336,34 @@ pub(crate) fn reverse_geocode(
         .map_err(|e| e.to_string())?
         .into_json()
         .map_err(|e| e.to_string())?;
-    let a = v.get("address").ok_or("Alamat tidak ditemukan")?;
-    let state = a
+    let a = v.get("address").ok_or("Address not found")?;
+
+    let iso_prov = a
+        .get("ISO3166-2-lvl4")
+        .and_then(|x| x.as_str())
+        .and_then(iso_to_province);
+    let raw_state = a
         .get("state")
         .or_else(|| a.get("province"))
-        .and_then(|x| x.as_str())
-        .ok_or("Provinsi tidak terdeteksi (di luar Indonesia?)")?
+        .and_then(|x| x.as_str());
+
+    let state = iso_prov
+        .or(raw_state)
+        .ok_or("Province not detected (outside Indonesia?)")?
         .to_string();
+
     let mut c = Vec::new();
+    let classify = |s: &str, default_kind: Option<bool>| -> Option<bool> {
+        let l = s.to_lowercase();
+        if l.contains("kabupaten") || l.contains("regency") || l.starts_with("kab") {
+            Some(false)
+        } else if l.starts_with("kota") || l.contains("city") {
+            Some(true)
+        } else {
+            default_kind
+        }
+    };
+
     for (key, default_kind) in [
         ("city", Some(true)),
         ("town", Some(true)),
@@ -297,18 +374,36 @@ pub(crate) fn reverse_geocode(
         ("city_district", None),
     ] {
         if let Some(s) = a.get(key).and_then(|x| x.as_str()) {
-            let l = s.to_lowercase();
-            let kind = if l.contains("kabupaten") || l.contains("regency") || l.starts_with("kab") {
-                Some(false)
-            } else if l.starts_with("kota") || l.contains("city") {
-                Some(true)
-            } else {
-                default_kind
-            };
-            c.push((s.to_string(), kind));
+            c.push((s.to_string(), classify(s, default_kind)));
         }
     }
-    Ok((state, c))
+
+    // If OSM tagged a regency/city (like "Ngawi") as address.state while ISO-lvl4 is the real province
+    if let Some(rs) = raw_state {
+        if norm_place(rs) != norm_place(&state) {
+            c.push((rs.to_string(), classify(rs, Some(false))));
+        }
+    }
+    if let Some(name) = v.get("name").and_then(|x| x.as_str()) {
+        if !name.is_empty() && norm_place(name) != norm_place(&state) {
+            c.push((name.to_string(), classify(name, None)));
+        }
+    }
+    if let Some(disp) = v.get("display_name").and_then(|x| x.as_str()) {
+        for part in disp.split(',').map(str::trim) {
+            if !part.is_empty()
+                && !part.eq_ignore_ascii_case("indonesia")
+                && norm_place(part) != norm_place(&state)
+                && part.chars().any(|ch| ch.is_alphabetic())
+            {
+                c.push((part.to_string(), classify(part, None)));
+            }
+        }
+    }
+
+    let res = (state, c);
+    *guard = Some((lat, lon, Instant::now(), res.clone()));
+    Ok(res)
 }
 
 fn norm_place(s: &str) -> String {
@@ -384,7 +479,7 @@ fn match_kabkota(list: &[String], cands: &[(String, Option<bool>)]) -> Option<St
             if *kind == Some(k_city) {
                 s += 10; // "Kota Bandung" vs "Kab. Bandung"
             }
-            s -= i as i32; // kandidat yang lebih spesifik menang saat seri
+            s -= i as i32; // more specific candidate wins ties
             if s > best.0 {
                 best = (s, Some(k));
             }
@@ -396,15 +491,15 @@ fn match_kabkota(list: &[String], cands: &[(String, Option<bool>)]) -> Option<St
 fn resolve_location() -> Result<(String, String), String> {
     let (lat, lon) = win_coords()
         .or_else(ip_coords)
-        .ok_or("Lokasi perangkat tidak tersedia")?;
+        .ok_or("Device location unavailable")?;
     let (state, cands) = reverse_geocode(lat, lon)?;
     let provs = json_strings(&equran_get("shalat/provinsi")?);
-    let prov = match_province(&provs, &state).ok_or("Provinsi tidak ada di data equran.id")?;
+    let prov = match_province(&provs, &state).ok_or("Province not found in equran.id")?;
     let kabs = json_strings(&equran_post(
         "shalat/kabkota",
         serde_json::json!({ "provinsi": prov }),
     )?);
-    let kab = match_kabkota(&kabs, &cands).ok_or("Kab/kota tidak cocok dengan data equran.id")?;
+    let kab = match_kabkota(&kabs, &cands).ok_or("City/regency not found in equran.id")?;
     Ok((prov, kab))
 }
 
@@ -564,11 +659,11 @@ pub(crate) fn draw_prayer_panel(ui: &mut egui::Ui, s: &PrayerState) {
     let dim = Color32::from_rgb(140, 142, 154);
     match &s.status {
         PrayerStatus::Locating => {
-            ui.colored_label(dim, "Mendeteksi lokasi…");
+            ui.colored_label(dim, "Detecting location…");
             return;
         }
         PrayerStatus::Loading => {
-            ui.colored_label(dim, "Memuat jadwal…");
+            ui.colored_label(dim, "Loading schedule…");
             return;
         }
         PrayerStatus::Error(e) => {
@@ -582,7 +677,7 @@ pub(crate) fn draw_prayer_panel(ui: &mut egui::Ui, s: &PrayerState) {
     let today = now.date_naive();
     let secs = now.num_seconds_from_midnight();
     let Some(day) = s.days.iter().find(|d| d.date == today) else {
-        ui.colored_label(dim, "Jadwal hari ini belum tersedia");
+        ui.colored_label(dim, "Today's schedule is unavailable");
         return;
     };
     let next = next_prayer(s);
@@ -619,7 +714,7 @@ pub(crate) fn draw_prayer_panel(ui: &mut egui::Ui, s: &PrayerState) {
         p.text(
             hr.right_top() + vec2(-4.0, 21.0),
             Align2::RIGHT_TOP,
-            format!("menuju {}", PRAYER_NAMES[i]),
+            format!("until {}", PRAYER_NAMES[i]),
             FontId::proportional(10.5),
             dim,
         );
@@ -736,7 +831,8 @@ pub(crate) fn spawn_prayer_worker(ctx: egui::Context, st: Arc<Mutex<PrayerState>
                             wait_retry(&st, 30);
                             continue;
                         }
-                        // pakai lokasi lama, coba lagi ~5 menit lagi
+                        st.lock().unwrap().status = PrayerStatus::Ready;
+                        ctx.request_repaint();
                         loc_checked = Instant::now().checked_sub(Duration::from_secs(1500));
                     }
                 }
@@ -752,7 +848,7 @@ pub(crate) fn spawn_prayer_worker(ctx: egui::Context, st: Arc<Mutex<PrayerState>
                 )
             };
 
-            if changed || !has_today {
+            if force || changed || !has_today {
                 {
                     let mut s = st.lock().unwrap();
                     if changed {
@@ -777,6 +873,8 @@ pub(crate) fn spawn_prayer_worker(ctx: egui::Context, st: Arc<Mutex<PrayerState>
                             let mut s = st.lock().unwrap();
                             if s.days.is_empty() {
                                 s.status = PrayerStatus::Error(e);
+                            } else {
+                                s.status = PrayerStatus::Ready;
                             }
                         }
                         ctx.request_repaint();
@@ -787,7 +885,7 @@ pub(crate) fn spawn_prayer_worker(ctx: egui::Context, st: Arc<Mutex<PrayerState>
                 ctx.request_repaint();
             }
 
-            // Akhir bulan: ambil bulan depan supaya Subuh besok tetap akurat.
+            // End of month: prefetch next month so tomorrow's Fajr remains accurate.
             let tm = today.succ_opt().unwrap_or(today);
             let need_next =
                 !st.lock().unwrap().days.iter().any(|d| d.date == tm) && next_tried != Some(today);
@@ -805,7 +903,7 @@ pub(crate) fn spawn_prayer_worker(ctx: egui::Context, st: Arc<Mutex<PrayerState>
     });
 }
 
-/// Kirim notifikasi ke pill saat waktu sholat masuk.
+/// Send notification to the pill when prayer time starts.
 pub(crate) fn spawn_prayer_notifier(
     ctx: egui::Context,
     st: Arc<Mutex<PrayerState>>,
@@ -830,11 +928,11 @@ pub(crate) fn spawn_prayer_notifier(
             let Some((t, kab)) = hit else { continue };
             for i in MAIN_PRAYERS {
                 let at = t[i] * 60;
-                // jendela 90 detik, jadi tidak spam kalau app baru dibuka lewat dari waktunya
+                // 90-second window so it won't spam if app is opened long after prayer time
                 if secs >= at && secs < at + 90 && fired.insert((today, i)) {
                     push_notice(
                         &notifs,
-                        &format!("Waktu {}", PRAYER_NAMES[i]),
+                        &format!("{} Time", PRAYER_NAMES[i]),
                         format!("{} · {}", fmt_hm(t[i]), kab.trim_start_matches("Kota ")),
                     );
                     ctx.request_repaint();

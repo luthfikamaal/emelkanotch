@@ -242,6 +242,8 @@ impl EmelkaNotch {
             || self.prev_section == Some(Section::Antigravity)
         {
             ANTIGRAVITY_PANEL_H
+        } else if self.section == Section::Prayer || self.prev_section == Some(Section::Prayer) {
+            PRAYER_PANEL_H
         } else {
             PANEL_H
         }

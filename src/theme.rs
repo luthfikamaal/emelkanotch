@@ -12,6 +12,7 @@ use std::time::Duration;
 // ---------- layout ----------
 pub(crate) const PANEL_W: f32 = 500.0;
 pub(crate) const PANEL_H: f32 = 212.0;
+pub(crate) const PRAYER_PANEL_H: f32 = 228.0;
 pub(crate) const WEATHER_PANEL_H: f32 = 358.0;
 pub(crate) const ANTIGRAVITY_PANEL_H: f32 = 358.0;
 pub(crate) const PILL_W: f32 = 240.0;
