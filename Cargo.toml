@@ -1,6 +1,6 @@
 [package]
 name = "EmelkaNotch"
-version = "0.8.1"
+version = "0.9.0"
 edition = "2021"
 
 [dependencies]
@@ -13,6 +13,8 @@ chrono = { version = "0.4", default-features = false, features = [
     "clock",
     "std",
 ] }
+arboard = "3.7"
+png = "0.18"
 
 [dependencies.windows]
 version = "0.58"
@@ -21,14 +23,19 @@ features = [
     "Media_Control",
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dwm",
     "Win32_System_Com",
     "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
     "Win32_Media_Audio",
     "Win32_Media_Audio_Endpoints",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Variant",
     "Devices_Geolocation",
     "Graphics_Imaging",
+    "Storage",
     "Storage_Streams",
     "Foundation_Collections",
 ]
@@ -43,4 +50,3 @@ lto = true
 codegen-units = 1
 strip = true
 panic = "abort"
-

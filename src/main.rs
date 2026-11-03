@@ -5,6 +5,7 @@ mod media;
 mod notification;
 mod osd;
 mod prayer;
+mod screenshot;
 mod sections;
 mod settings;
 mod system;
@@ -28,6 +29,7 @@ use media::{spawn_media_worker, Cmd, Lyrics, Media, Shared};
 use notification::{push_notice, spawn_notif_worker, Notif, NotifState};
 use osd::{spawn_brightness_worker, spawn_volume_worker, OsdEvent, OsdKind, OsdState};
 use prayer::{load_prayer_cache, spawn_prayer_notifier, spawn_prayer_worker, PrayerState};
+use screenshot::{load_screenshot_state, spawn_hotkey_worker, OverlayPhase, ScreenshotState};
 use settings::{load_settings, NotchStyle};
 use system::{read_disks, DiskInfo};
 use tasks::{load_todos, spawn_todo_worker, TodoState};
@@ -97,6 +99,11 @@ struct EmelkaNotch {
     prayer: Arc<Mutex<PrayerState>>,
     weather: Arc<Mutex<WeatherState>>,
     pub(crate) antigravity: Arc<Mutex<AntigravityState>>,
+    pub(crate) screenshot: Arc<Mutex<ScreenshotState>>,
+    pub(crate) overlay: OverlayPhase,
+    pub(crate) ss_preview_tex: Option<(u64, egui::TextureHandle)>,
+    pub(crate) ss_desktop_tex: Option<(u64, egui::TextureHandle)>,
+    pub(crate) ss_desktop_ver: u64,
 
     // tasks
     todos: Arc<Mutex<TodoState>>,
@@ -112,6 +119,7 @@ struct EmelkaNotch {
     prev_section: Option<Section>,
     tab_t: f32,
     tab_dir: f32,
+    tab_from_h: f32,
     pk_anim: f32, // 0 = task list, 1 = date/time picker
     cur_alpha: f32,
     added: Option<(u64, Instant)>,
@@ -157,6 +165,8 @@ impl EmelkaNotch {
         spawn_weather_worker(cc.egui_ctx.clone(), weather.clone());
         let antigravity = Arc::new(Mutex::new(AntigravityState::default()));
         spawn_antigravity_worker(cc.egui_ctx.clone(), antigravity.clone());
+        let screenshot = Arc::new(Mutex::new(load_screenshot_state()));
+        spawn_hotkey_worker(cc.egui_ctx.clone(), screenshot.clone());
         let (style, osd_enabled) = load_settings();
         let osd = Arc::new(Mutex::new(OsdState::default()));
         spawn_volume_worker(cc.egui_ctx.clone(), osd.clone());
@@ -206,6 +216,11 @@ impl EmelkaNotch {
             prayer,
             weather,
             antigravity,
+            screenshot,
+            overlay: OverlayPhase::Idle,
+            ss_preview_tex: None,
+            ss_desktop_tex: None,
+            ss_desktop_ver: 0,
             todos,
             todo_text: String::new(),
             todo_due: None,
@@ -217,6 +232,7 @@ impl EmelkaNotch {
             prev_section: None,
             tab_t: 1.0,
             tab_dir: 1.0,
+            tab_from_h: PANEL_H,
             pk_anim: 0.0,
             cur_alpha: 1.0,
             added: None,
@@ -233,20 +249,18 @@ impl EmelkaNotch {
         lerp(TOP, 0.0, self.style_t)
     }
 
-    /// Weather and Antigravity get taller panels so cards have room to breathe.
-    /// Keep it tall through the slide transition so the outgoing content isn't clipped.
-    fn panel_target_h(&self) -> f32 {
-        if self.section == Section::Weather || self.prev_section == Some(Section::Weather) {
-            WEATHER_PANEL_H
-        } else if self.section == Section::Antigravity
-            || self.prev_section == Some(Section::Antigravity)
-        {
-            ANTIGRAVITY_PANEL_H
-        } else if self.section == Section::Prayer || self.prev_section == Some(Section::Prayer) {
-            PRAYER_PANEL_H
-        } else {
-            PANEL_H
+    fn section_h(sec: Section) -> f32 {
+        match sec {
+            Section::Weather => WEATHER_PANEL_H,
+            Section::Antigravity => ANTIGRAVITY_PANEL_H,
+            Section::Screenshot => SCREENSHOT_PANEL_H,
+            Section::Prayer => PRAYER_PANEL_H,
+            _ => PANEL_H,
         }
+    }
+
+    fn panel_target_h(&self) -> f32 {
+        Self::section_h(self.section)
     }
 
     fn corner_radius(&self, e: f32) -> CornerRadius {
@@ -311,12 +325,17 @@ impl EmelkaNotch {
     fn update_hover(&mut self, ctx: &egui::Context) {
         let dt = ctx.input(|i| i.stable_dt).min(0.05);
         let target_h = self.panel_target_h();
-        let kh = 1.0 - (-dt * 14.0).exp();
-        self.panel_cur_h += (target_h - self.panel_cur_h) * kh;
-        if (target_h - self.panel_cur_h).abs() < 0.5 {
-            self.panel_cur_h = target_h;
+        if self.prev_section.is_some() {
+            self.tab_t = (self.tab_t + dt / 0.30).min(1.0);
+            self.panel_cur_h = lerp(self.tab_from_h, target_h, ease_out(self.tab_t));
+            if self.tab_t >= 1.0 {
+                self.panel_cur_h = target_h;
+                self.prev_section = None;
+            } else {
+                ctx.request_repaint();
+            }
         } else {
-            ctx.request_repaint();
+            self.panel_cur_h = target_h;
         }
 
         let shape = shape_rect(
@@ -653,10 +672,12 @@ impl EmelkaNotch {
                 (Section::Todo, "Tasks"),
                 (Section::Prayer, "Prayer"),
                 (Section::Antigravity, "Antigravity"),
+                (Section::Screenshot, "Screenshot"),
                 (Section::Settings, "Settings"),
             ] {
                 if tab_icon(ui, s, label, self.section == s) && self.section != s {
                     self.prev_section = Some(self.section);
+                    self.tab_from_h = self.panel_cur_h;
                     self.tab_dir = if (s as usize) > (self.section as usize) {
                         1.0
                     } else {
@@ -672,13 +693,6 @@ impl EmelkaNotch {
         });
         ui.add_space(10.0);
 
-        let dt = ui.input(|i| i.stable_dt).min(0.05);
-        if self.prev_section.is_some() {
-            self.tab_t = (self.tab_t + dt / 0.30).min(1.0);
-            if self.tab_t >= 1.0 {
-                self.prev_section = None;
-            }
-        }
         let content = ui.available_rect_before_wrap();
         match self.prev_section {
             Some(prev) => {
@@ -686,18 +700,22 @@ impl EmelkaNotch {
                 let e = ease_out(self.tab_t);
                 let w = content.width();
                 let a = self.cur_alpha;
+                let old_h = (Self::section_h(prev) - PAD * 2.0 - 38.0).max(100.0);
+                let old_rect = Rect::from_min_size(content.min, vec2(w, old_h));
                 let mut old = ui::slide_child(
                     ui,
-                    content,
+                    old_rect,
                     -self.tab_dir * e * w,
                     a * (1.0 - e),
                     ("sec", prev as u8),
                 );
                 self.draw_section(&mut old, prev, media, pos_ms, lyrics);
                 let cur = self.section;
+                let new_h = (Self::section_h(cur) - PAD * 2.0 - 38.0).max(100.0);
+                let new_rect = Rect::from_min_size(content.min, vec2(w, new_h));
                 let mut new = ui::slide_child(
                     ui,
-                    content,
+                    new_rect,
                     self.tab_dir * (1.0 - e) * w,
                     a * e,
                     ("sec", cur as u8),
@@ -725,6 +743,7 @@ impl EmelkaNotch {
             Section::Todo => self.todo_section(ui),
             Section::Prayer => self.prayer_section(ui),
             Section::Antigravity => self.antigravity_section(ui),
+            Section::Screenshot => self.screenshot_section(ui),
             Section::Settings => self.settings_section(ui),
         }
     }
@@ -748,12 +767,21 @@ impl eframe::App for EmelkaNotch {
 
         self.sample_system();
         self.style_t = settings::style_progress(ctx, self.style);
-        self.update_hover(ctx);
+        self.update_capture_overlay(ctx);
+
+        let capturing = !matches!(self.overlay, OverlayPhase::Idle);
+        if !capturing {
+            self.update_hover(ctx);
+        }
         let e = ease(self.t);
 
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
-            .show(ctx, |ui| self.draw(ui, e));
+            .show(ctx, |ui| {
+                if !capturing {
+                    self.draw(ui, e);
+                }
+            });
 
         let playing = self.shared.lock().unwrap().media.playing;
         if self.t > 0.0 || self.animating || settings::style_animating(self.style_t) {

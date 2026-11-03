@@ -6,6 +6,11 @@ use crate::antigravity::AuthStatus;
 use crate::media::{self, app_key, track_key, Lyrics, Media, LYRIC_LEAD_MS};
 use crate::notification::activate_notif;
 use crate::prayer::{fmt_hm, prayer_color, prayer_icon, MAIN_PRAYERS, PRAYER_NAMES};
+use crate::screenshot::{
+    capture_raw_desktop, copy_rgba_to_clipboard, crop_desktop, process_capture_async,
+    save_screenshot_settings, screenshots_dir, spawn_bg_image_picker, BgMode, CaptureMode,
+    OverlayPhase,
+};
 use crate::settings::{save_settings, NotchStyle};
 use crate::system::{fmt_due, fmt_gb};
 use crate::tasks::{save_todos, Todo};
@@ -23,7 +28,7 @@ impl EmelkaNotch {
     pub(crate) fn update_button(&self, ui: &mut Ui) {
         let status = self.upd.lock().unwrap().clone();
         let (label, busy) = match &status {
-            Upd::Idle => (format!("v{VERSION} · Check for updates"), false),
+            Upd::Idle => (format!("v{VERSION}"), false),
             Upd::Checking => ("Checking…".to_string(), true),
             Upd::UpToDate => (format!("v{VERSION} · Up to date"), false),
             Upd::Updating(t) => (format!("Updating to {t}…"), true),
@@ -2339,6 +2344,889 @@ impl EmelkaNotch {
                         semibold(13.0),
                         MUTED,
                     );
+                }
+            }
+        }
+    }
+
+    // =====================================================================
+    // Screenshot Tool Section & Interactive Overlay
+    // =====================================================================
+
+    pub(crate) fn start_capture(&mut self, ctx: &egui::Context, mode: CaptureMode) {
+        self.open = false;
+        self.t = 0.0;
+        self.hover_since = None;
+        self.overlay = OverlayPhase::Preparing {
+            mode,
+            started: Instant::now(),
+        };
+        ctx.request_repaint();
+    }
+
+    pub(crate) fn screenshot_section(&mut self, ui: &mut Ui) {
+        let w = ui.available_width();
+        ui.spacing_mut().item_spacing.y = 0.0;
+
+        // 1. Top Row: 3 Capture Mode Cards (Window, Region, Fullscreen)
+        let gap = 8.0;
+        let card_w = (w - gap * 2.0) / 3.0;
+        let card_h = 54.0;
+        let (row_rect, _) = ui.allocate_exact_size(vec2(w, card_h), Sense::hover());
+
+        let modes = [
+            (CaptureMode::Window, "Window", "Click a window"),
+            (CaptureMode::Region, "Region", "Alt + Shift + S"),
+            (CaptureMode::Screen, "Fullscreen", "Entire display"),
+        ];
+
+        let busy = self.screenshot.lock().unwrap().busy;
+
+        for (i, (mode, title, sub)) in modes.iter().enumerate() {
+            let x = row_rect.left() + i as f32 * (card_w + gap);
+            let r = Rect::from_min_size(pos2(x, row_rect.top()), vec2(card_w, card_h));
+            let resp = btn_rect(ui, r, ("ss_mode_card", i));
+            let hov = resp.hovered() && !busy;
+
+            let p = ui.painter_at(r);
+            let fill = if hov {
+                Color32::from_rgb(24, 26, 35)
+            } else {
+                CARD
+            };
+            let border_col = if hov {
+                ACCENT.gamma_multiply(0.75)
+            } else {
+                BORDER
+            };
+            p.rect_filled(r, CornerRadius::same(12), fill);
+            p.rect_stroke(
+                r,
+                CornerRadius::same(12),
+                Stroke::new(1.0, border_col),
+                StrokeKind::Inside,
+            );
+
+            // Icon badge on the left
+            let ic = pos2(r.left() + 24.0, r.center().y);
+            p.circle_filled(
+                ic,
+                14.0,
+                if hov {
+                    ACCENT.gamma_multiply(0.20)
+                } else {
+                    Color32::from_rgb(24, 26, 34)
+                },
+            );
+            let ic_col = if hov { ACCENT } else { TEXT };
+            let st = Stroke::new(1.4, ic_col);
+
+            match mode {
+                CaptureMode::Window => {
+                    let wr = Rect::from_center_size(ic, vec2(13.0, 10.0));
+                    p.rect_stroke(wr, CornerRadius::same(2), st, StrokeKind::Inside);
+                    p.line_segment(
+                        [
+                            pos2(wr.left(), wr.top() + 3.2),
+                            pos2(wr.right(), wr.top() + 3.2),
+                        ],
+                        Stroke::new(1.0, ic_col),
+                    );
+                }
+                CaptureMode::Region => {
+                    let cr = Rect::from_center_size(ic, vec2(12.0, 10.0));
+                    let len = 3.5;
+                    // 4 viewfinder corners
+                    p.line_segment([cr.left_top(), cr.left_top() + vec2(len, 0.0)], st);
+                    p.line_segment([cr.left_top(), cr.left_top() + vec2(0.0, len)], st);
+                    p.line_segment([cr.right_top(), cr.right_top() + vec2(-len, 0.0)], st);
+                    p.line_segment([cr.right_top(), cr.right_top() + vec2(0.0, len)], st);
+                    p.line_segment([cr.left_bottom(), cr.left_bottom() + vec2(len, 0.0)], st);
+                    p.line_segment([cr.left_bottom(), cr.left_bottom() + vec2(0.0, -len)], st);
+                    p.line_segment([cr.right_bottom(), cr.right_bottom() + vec2(-len, 0.0)], st);
+                    p.line_segment([cr.right_bottom(), cr.right_bottom() + vec2(0.0, -len)], st);
+                }
+                CaptureMode::Screen => {
+                    let sr = Rect::from_center_size(ic + vec2(0.0, -1.0), vec2(13.0, 9.0));
+                    p.rect_stroke(sr, CornerRadius::same(2), st, StrokeKind::Inside);
+                    p.line_segment(
+                        [
+                            pos2(ic.x - 3.0, sr.bottom() + 2.5),
+                            pos2(ic.x + 3.0, sr.bottom() + 2.5),
+                        ],
+                        st,
+                    );
+                }
+            }
+
+            p.text(
+                pos2(r.left() + 45.0, r.center().y - 7.0),
+                Align2::LEFT_CENTER,
+                *title,
+                semibold(12.0),
+                TEXT,
+            );
+            p.text(
+                pos2(r.left() + 45.0, r.center().y + 8.0),
+                Align2::LEFT_CENTER,
+                *sub,
+                FontId::proportional(10.0),
+                if *mode == CaptureMode::Region {
+                    ACCENT.gamma_multiply(0.9)
+                } else {
+                    MUTED
+                },
+            );
+
+            if resp.clicked() && !busy {
+                let ctx = ui.ctx().clone();
+                self.start_capture(&ctx, *mode);
+            }
+        }
+
+        ui.add_space(8.0);
+
+        // 2. Middle Bar: Background Mode (White / Image / Clear) + Set Background Image + Shadow
+        let (bar_rect, p) = card(ui, w, 36.0);
+        let (bg_mode, bg_path, shadow_enabled, picking_bg) = {
+            let st = self.screenshot.lock().unwrap();
+            (
+                st.bg_mode,
+                st.bg_image_path.clone(),
+                st.shadow_enabled,
+                st.picking_bg,
+            )
+        };
+
+        p.text(
+            pos2(bar_rect.left() + 12.0, bar_rect.center().y),
+            Align2::LEFT_CENTER,
+            "BG:",
+            semibold(11.0),
+            MUTED,
+        );
+
+        let mut x_cur = bar_rect.left() + 38.0;
+        for (m, label) in [
+            (BgMode::White, "White"),
+            (BgMode::Image, "Image"),
+            (BgMode::Transparent, "Clear"),
+        ] {
+            let pill_w = 50.0;
+            let pill_r =
+                Rect::from_min_size(pos2(x_cur, bar_rect.center().y - 11.0), vec2(pill_w, 22.0));
+            let resp = btn_rect(ui, pill_r, ("ss_bg_mode", label));
+            let active = bg_mode == m;
+            let fill = if active {
+                ACCENT.gamma_multiply(0.22)
+            } else if resp.hovered() {
+                Color32::from_rgb(28, 30, 38)
+            } else {
+                Color32::from_rgb(20, 21, 27)
+            };
+            p.rect_filled(pill_r, CornerRadius::same(6), fill);
+            if active {
+                p.rect_stroke(
+                    pill_r,
+                    CornerRadius::same(6),
+                    Stroke::new(1.0, ACCENT.gamma_multiply(0.8)),
+                    StrokeKind::Inside,
+                );
+            }
+            p.text(
+                pill_r.center(),
+                Align2::CENTER_CENTER,
+                label,
+                semibold(10.5),
+                if active { TEXT } else { MUTED },
+            );
+            if resp.clicked() {
+                if m == BgMode::Image && bg_path.is_none() {
+                    spawn_bg_image_picker(ui.ctx().clone(), self.screenshot.clone());
+                } else {
+                    let mut st = self.screenshot.lock().unwrap();
+                    st.bg_mode = m;
+                    save_screenshot_settings(&st);
+                }
+            }
+            x_cur += pill_w + 4.0;
+        }
+
+        // "Set BG Image..." button
+        let bg_btn_label = if picking_bg {
+            "Selecting…".to_string()
+        } else if let Some(ref path) = bg_path {
+            let fname = std::path::Path::new(path)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "Custom BG".to_string());
+            format!("🖼 {}", ellipsize(&fname, 14))
+        } else {
+            "Set BG Image…".to_string()
+        };
+        let bg_btn_w = 114.0;
+        let bg_btn_r = Rect::from_min_size(
+            pos2(x_cur + 4.0, bar_rect.center().y - 11.0),
+            vec2(bg_btn_w, 22.0),
+        );
+        let bg_resp = btn_rect(ui, bg_btn_r, "ss_pick_bg_btn");
+        p.rect_filled(
+            bg_btn_r,
+            CornerRadius::same(6),
+            field_fill(bg_resp.hovered(), false),
+        );
+        p.rect_stroke(
+            bg_btn_r,
+            CornerRadius::same(6),
+            Stroke::new(1.0, BORDER),
+            StrokeKind::Inside,
+        );
+        let (fit_lbl, _) = fit(
+            &p,
+            &bg_btn_label,
+            FontId::proportional(10.5),
+            bg_btn_w - 12.0,
+        );
+        p.text(
+            bg_btn_r.center(),
+            Align2::CENTER_CENTER,
+            fit_lbl,
+            FontId::proportional(10.5),
+            if bg_resp.hovered() { TEXT } else { MUTED },
+        );
+        if bg_resp
+            .on_hover_text("Choose background image (PNG/JPG/WEBP/BMP)")
+            .clicked()
+            && !picking_bg
+        {
+            spawn_bg_image_picker(ui.ctx().clone(), self.screenshot.clone());
+        }
+
+        // Shadow toggle on the right of the bar
+        let sh_w = 68.0;
+        let sh_r = Rect::from_min_size(
+            pos2(bar_rect.right() - sh_w - 10.0, bar_rect.center().y - 11.0),
+            vec2(sh_w, 22.0),
+        );
+        let sh_resp = btn_rect(ui, sh_r, "ss_shadow_toggle");
+        p.rect_filled(
+            sh_r,
+            CornerRadius::same(6),
+            if shadow_enabled {
+                GREEN.gamma_multiply(0.16)
+            } else {
+                Color32::from_rgb(20, 21, 27)
+            },
+        );
+        p.circle_filled(
+            pos2(sh_r.left() + 11.0, sh_r.center().y),
+            3.2,
+            if shadow_enabled { GREEN } else { DIM },
+        );
+        p.text(
+            pos2(sh_r.left() + 20.0, sh_r.center().y),
+            Align2::LEFT_CENTER,
+            "Shadow",
+            semibold(10.5),
+            if shadow_enabled { TEXT } else { MUTED },
+        );
+        if sh_resp.clicked() {
+            let mut st = self.screenshot.lock().unwrap();
+            st.shadow_enabled = !st.shadow_enabled;
+            save_screenshot_settings(&st);
+        }
+
+        ui.add_space(8.0);
+
+        // 3. Bottom Row: Preview & Quick Actions Card
+        let prev_h = ui.available_height().max(132.0);
+        let (card_r, p) = card(ui, w, prev_h);
+
+        let (latest, status_msg) = {
+            let st = self.screenshot.lock().unwrap();
+            (st.latest.clone(), st.status_msg.clone())
+        };
+
+        let thumb_rect = Rect::from_min_size(
+            pos2(card_r.left() + 10.0, card_r.top() + 10.0),
+            vec2(186.0, prev_h - 20.0),
+        );
+        p.rect_filled(
+            thumb_rect,
+            CornerRadius::same(8),
+            Color32::from_rgb(10, 11, 15),
+        );
+        p.rect_stroke(
+            thumb_rect,
+            CornerRadius::same(8),
+            Stroke::new(1.0, BORDER),
+            StrokeKind::Inside,
+        );
+
+        if let Some(ref cap) = latest {
+            let need_load = self
+                .ss_preview_tex
+                .as_ref()
+                .map_or(true, |(v, _)| *v != cap.ver);
+            if need_load {
+                let tex = ui.ctx().load_texture(
+                    "ss_latest_preview",
+                    (*cap.preview).clone(),
+                    egui::TextureOptions::LINEAR,
+                );
+                self.ss_preview_tex = Some((cap.ver, tex));
+            }
+            if let Some((_, ref tex)) = self.ss_preview_tex {
+                let avail = thumb_rect.shrink(6.0);
+                let aspect = cap.width as f32 / cap.height.max(1) as f32;
+                let box_aspect = avail.width() / avail.height().max(1.0);
+                let img_size = if aspect > box_aspect {
+                    vec2(avail.width(), avail.width() / aspect)
+                } else {
+                    vec2(avail.height() * aspect, avail.height())
+                };
+                let img_rect = Rect::from_center_size(avail.center(), img_size);
+                p.image(
+                    tex.id(),
+                    img_rect,
+                    Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+            }
+        } else {
+            // Live style mockup when no screenshot has been taken yet
+            let mock_bg = thumb_rect.shrink(8.0);
+            let bg_col = match bg_mode {
+                BgMode::White => Color32::from_rgb(245, 246, 250),
+                BgMode::Image => Color32::from_rgb(55, 75, 120),
+                BgMode::Transparent => Color32::from_rgb(22, 24, 30),
+            };
+            p.rect_filled(mock_bg, CornerRadius::same(6), bg_col);
+            let win_r = Rect::from_center_size(mock_bg.center(), vec2(116.0, 64.0));
+            if shadow_enabled {
+                p.rect_filled(
+                    win_r.translate(vec2(0.0, 4.0)).expand(3.0),
+                    CornerRadius::same(7),
+                    Color32::from_black_alpha(65),
+                );
+            }
+            p.rect_filled(win_r, CornerRadius::same(6), Color32::from_rgb(24, 26, 34));
+            // 3 window header dots in mockup
+            p.circle_filled(
+                pos2(win_r.left() + 10.0, win_r.top() + 9.0),
+                2.5,
+                Color32::from_rgb(255, 95, 86),
+            );
+            p.circle_filled(
+                pos2(win_r.left() + 18.0, win_r.top() + 9.0),
+                2.5,
+                Color32::from_rgb(255, 189, 46),
+            );
+            p.circle_filled(
+                pos2(win_r.left() + 26.0, win_r.top() + 9.0),
+                2.5,
+                Color32::from_rgb(39, 201, 63),
+            );
+            p.text(
+                win_r.center() + vec2(0.0, 4.0),
+                Align2::CENTER_CENTER,
+                "Preview",
+                FontId::proportional(10.0),
+                MUTED,
+            );
+        }
+
+        // Right column details & buttons
+        let rx = thumb_rect.right() + 14.0;
+        let r_max = card_r.right() - 12.0 - rx;
+
+        if let Some(ref cap) = latest {
+            let fname = cap
+                .saved_path
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "Screenshot.png".to_string());
+            let (fit_name, _) = fit(&p, &fname, semibold(12.5), r_max - 42.0);
+            p.text(
+                pos2(rx, card_r.top() + 22.0),
+                Align2::LEFT_CENTER,
+                fit_name,
+                semibold(12.5),
+                TEXT,
+            );
+            p.text(
+                pos2(card_r.right() - 12.0, card_r.top() + 22.0),
+                Align2::RIGHT_CENTER,
+                ago(cap.at),
+                FontId::proportional(10.5),
+                MUTED,
+            );
+
+            let mode_name = match cap.mode {
+                CaptureMode::Window => "Window",
+                CaptureMode::Region => "Region",
+                CaptureMode::Screen => "Fullscreen",
+            };
+            p.text(
+                pos2(rx, card_r.top() + 42.0),
+                Align2::LEFT_CENTER,
+                format!(
+                    "{} × {} px  ·  {} capture",
+                    cap.width, cap.height, mode_name
+                ),
+                FontId::proportional(11.0),
+                MUTED,
+            );
+        } else {
+            p.text(
+                pos2(rx, card_r.top() + 24.0),
+                Align2::LEFT_CENTER,
+                "Ready to Capture",
+                semibold(13.0),
+                TEXT,
+            );
+            p.text(
+                pos2(rx, card_r.top() + 44.0),
+                Align2::LEFT_CENTER,
+                "Press Alt+Shift+S or select a mode above.",
+                FontId::proportional(11.0),
+                MUTED,
+            );
+            p.text(
+                pos2(rx, card_r.top() + 62.0),
+                Align2::LEFT_CENTER,
+                "Auto-copies to Clipboard & saves PNG.",
+                FontId::proportional(10.5),
+                DIM,
+            );
+        }
+
+        if let Some((msg, at)) = status_msg {
+            if at.elapsed().as_secs() < 5 {
+                let (fit_msg, _) = fit(&p, &msg, FontId::proportional(10.5), r_max);
+                p.text(
+                    pos2(rx, card_r.top() + 66.0),
+                    Align2::LEFT_CENTER,
+                    fit_msg,
+                    FontId::proportional(10.5),
+                    GREEN,
+                );
+            }
+        }
+
+        // Action buttons at bottom right
+        let btn_y = card_r.bottom() - 38.0;
+        let btn_h = 28.0;
+        let copy_r = Rect::from_min_size(pos2(rx, btn_y), vec2(115.0, btn_h));
+        if text_btn(
+            ui,
+            &p,
+            copy_r,
+            "Copy to Clipboard",
+            "ss_copy_latest",
+            true,
+            latest.is_some(),
+        ) {
+            if let Some(ref cap) = latest {
+                if copy_rgba_to_clipboard(cap.width, cap.height, &cap.rgba) {
+                    self.screenshot.lock().unwrap().status_msg =
+                        Some(("Copied to clipboard!".to_string(), Instant::now()));
+                }
+            }
+        }
+
+        let dir_r = Rect::from_min_size(pos2(rx + 123.0, btn_y), vec2(115.0, btn_h));
+        if text_btn(ui, &p, dir_r, "Open Folder", "ss_open_folder", false, true) {
+            let folder = latest
+                .as_ref()
+                .and_then(|c| c.saved_path.as_ref())
+                .and_then(|p| p.parent())
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(screenshots_dir);
+            let _ = std::process::Command::new("explorer.exe")
+                .arg(folder)
+                .spawn();
+        }
+    }
+
+    pub(crate) fn update_capture_overlay(&mut self, ctx: &egui::Context) {
+        // Check if global hotkey Alt+Shift+S fired
+        let hk = self.screenshot.lock().unwrap().hotkey_triggered.take();
+        if let Some(mode) = hk {
+            if matches!(self.overlay, OverlayPhase::Idle) {
+                self.start_capture(ctx, mode);
+            }
+        }
+
+        match self.overlay.clone() {
+            OverlayPhase::Idle => {}
+            OverlayPhase::Preparing { mode, started } => {
+                if started.elapsed() < std::time::Duration::from_millis(90) {
+                    ctx.request_repaint();
+                    return;
+                }
+                let Some(desktop) = capture_raw_desktop() else {
+                    self.overlay = OverlayPhase::Idle;
+                    return;
+                };
+                if mode == CaptureMode::Screen {
+                    self.overlay = OverlayPhase::Idle;
+                    process_capture_async(
+                        ctx.clone(),
+                        self.screenshot.clone(),
+                        self.notifs.clone(),
+                        CaptureMode::Screen,
+                        desktop.width,
+                        desktop.height,
+                        (*desktop.rgba).clone(),
+                    );
+                } else {
+                    self.ss_desktop_ver = self.ss_desktop_ver.wrapping_add(1);
+                    let img = egui::ColorImage::from_rgba_unmultiplied(
+                        [desktop.width as usize, desktop.height as usize],
+                        &desktop.rgba,
+                    );
+                    let tex =
+                        ctx.load_texture("ss_desktop_freeze", img, egui::TextureOptions::LINEAR);
+                    self.ss_desktop_tex = Some((self.ss_desktop_ver, tex));
+                    self.overlay = OverlayPhase::Active {
+                        mode,
+                        desktop,
+                        drag_start: None,
+                        drag_cur: None,
+                    };
+                    ctx.request_repaint();
+                }
+            }
+            OverlayPhase::Active {
+                mut mode,
+                desktop,
+                mut drag_start,
+                mut drag_cur,
+            } => {
+                let ppp = ctx.pixels_per_point();
+                let screen_w = desktop.width as f32 / ppp;
+                let screen_h = desktop.height as f32 / ppp;
+                let mut next_overlay: Option<OverlayPhase> = None;
+                let mut finish_crop: Option<(CaptureMode, [i32; 4])> = None;
+                let tex_opt = self.ss_desktop_tex.as_ref().map(|(_, t)| t.clone());
+
+                let vp_builder = egui::ViewportBuilder::default()
+                    .with_title("EmelkaNotch Capture")
+                    .with_position([0.0, 0.0])
+                    .with_inner_size([screen_w, screen_h])
+                    .with_decorations(false)
+                    .with_always_on_top()
+                    .with_resizable(false)
+                    .with_taskbar(false);
+
+                ctx.show_viewport_immediate(
+                    egui::ViewportId::from_hash_of("emelka_capture_overlay"),
+                    vp_builder,
+                    |vp_ctx, _| {
+                        if vp_ctx.input(|i| {
+                            i.key_pressed(egui::Key::Escape) || i.pointer.secondary_clicked()
+                        }) {
+                            next_overlay = Some(OverlayPhase::Idle);
+                            return;
+                        }
+                        if vp_ctx.input(|i| i.key_pressed(egui::Key::Space)) {
+                            mode = if mode == CaptureMode::Region {
+                                CaptureMode::Window
+                            } else {
+                                CaptureMode::Region
+                            };
+                            drag_start = None;
+                            drag_cur = None;
+                        }
+
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::NONE)
+                            .show(vp_ctx, |ui| {
+                                let full_rect =
+                                    Rect::from_min_size(pos2(0.0, 0.0), vec2(screen_w, screen_h));
+                                let p = ui.painter().clone();
+
+                                // 1. Draw frozen desktop
+                                if let Some(ref tex) = tex_opt {
+                                    p.image(
+                                        tex.id(),
+                                        full_rect,
+                                        Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                                        Color32::WHITE,
+                                    );
+                                }
+                                // 2. Dim backdrop
+                                p.rect_filled(
+                                    full_rect,
+                                    CornerRadius::ZERO,
+                                    Color32::from_black_alpha(115),
+                                );
+
+                                // Floating bottom toolbar rect (so clicks on it don't trigger capture)
+                                let bar_r = Rect::from_center_size(
+                                    pos2(screen_w * 0.5, (screen_h - 54.0).max(40.0)),
+                                    vec2(430.0, 40.0),
+                                );
+                                let ptr_pos = ui.input(|i| i.pointer.interact_pos());
+                                let over_bar = ptr_pos.map_or(false, |pos| bar_r.contains(pos));
+
+                                match mode {
+                                    CaptureMode::Region => {
+                                        if !over_bar {
+                                            ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+                                            if ui.input(|i| i.pointer.primary_pressed()) {
+                                                drag_start = ptr_pos;
+                                                drag_cur = ptr_pos;
+                                            } else if ui.input(|i| i.pointer.primary_down())
+                                                && drag_start.is_some()
+                                            {
+                                                drag_cur = ptr_pos;
+                                            }
+                                        }
+
+                                        if let (Some(s), Some(c)) = (drag_start, drag_cur) {
+                                            let sel = Rect::from_two_pos(s, c);
+                                            if let Some(ref tex) = tex_opt {
+                                                let uv = Rect::from_min_max(
+                                                    pos2(
+                                                        (sel.left() / screen_w).clamp(0.0, 1.0),
+                                                        (sel.top() / screen_h).clamp(0.0, 1.0),
+                                                    ),
+                                                    pos2(
+                                                        (sel.right() / screen_w).clamp(0.0, 1.0),
+                                                        (sel.bottom() / screen_h).clamp(0.0, 1.0),
+                                                    ),
+                                                );
+                                                p.image(tex.id(), sel, uv, Color32::WHITE);
+                                            }
+                                            p.rect_stroke(
+                                                sel,
+                                                CornerRadius::same(4),
+                                                Stroke::new(1.5, Color32::WHITE),
+                                                StrokeKind::Outside,
+                                            );
+
+                                            let x0 = (sel.left() * ppp).round() as i32;
+                                            let y0 = (sel.top() * ppp).round() as i32;
+                                            let x1 = (sel.right() * ppp).round() as i32;
+                                            let y1 = (sel.bottom() * ppp).round() as i32;
+                                            let pw = (x1 - x0).max(0);
+                                            let ph = (y1 - y0).max(0);
+
+                                            // Dimension badge
+                                            let badge_r = Rect::from_center_size(
+                                                pos2(sel.center().x, (sel.top() - 18.0).max(20.0)),
+                                                vec2(104.0, 24.0),
+                                            );
+                                            p.rect_filled(
+                                                badge_r,
+                                                CornerRadius::same(12),
+                                                Color32::from_black_alpha(210),
+                                            );
+                                            p.text(
+                                                badge_r.center(),
+                                                Align2::CENTER_CENTER,
+                                                format!("{pw} × {ph}"),
+                                                semibold(11.5),
+                                                TEXT,
+                                            );
+
+                                            if ui.input(|i| i.pointer.primary_released()) {
+                                                if pw >= 12 && ph >= 12 {
+                                                    finish_crop = Some((
+                                                        CaptureMode::Region,
+                                                        [x0, y0, x1, y1],
+                                                    ));
+                                                } else {
+                                                    drag_start = None;
+                                                    drag_cur = None;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    CaptureMode::Window | CaptureMode::Screen => {
+                                        if !over_bar {
+                                            ui.ctx()
+                                                .set_cursor_icon(egui::CursorIcon::PointingHand);
+                                        }
+                                        let hovered_win = ptr_pos.and_then(|pos| {
+                                            if over_bar {
+                                                return None;
+                                            }
+                                            let px = (pos.x * ppp).round() as i32;
+                                            let py = (pos.y * ppp).round() as i32;
+                                            desktop.windows.iter().find(|w| {
+                                                px >= w.rect[0]
+                                                    && px <= w.rect[2]
+                                                    && py >= w.rect[1]
+                                                    && py <= w.rect[3]
+                                            })
+                                        });
+
+                                        if let Some(win) = hovered_win {
+                                            let wr = Rect::from_min_max(
+                                                pos2(
+                                                    win.rect[0] as f32 / ppp,
+                                                    win.rect[1] as f32 / ppp,
+                                                ),
+                                                pos2(
+                                                    win.rect[2] as f32 / ppp,
+                                                    win.rect[3] as f32 / ppp,
+                                                ),
+                                            );
+                                            if let Some(ref tex) = tex_opt {
+                                                let uv = Rect::from_min_max(
+                                                    pos2(
+                                                        (wr.left() / screen_w).clamp(0.0, 1.0),
+                                                        (wr.top() / screen_h).clamp(0.0, 1.0),
+                                                    ),
+                                                    pos2(
+                                                        (wr.right() / screen_w).clamp(0.0, 1.0),
+                                                        (wr.bottom() / screen_h).clamp(0.0, 1.0),
+                                                    ),
+                                                );
+                                                p.image(tex.id(), wr, uv, Color32::WHITE);
+                                            }
+                                            p.rect_stroke(
+                                                wr,
+                                                CornerRadius::same(10),
+                                                Stroke::new(2.5, ACCENT),
+                                                StrokeKind::Outside,
+                                            );
+
+                                            let pw = win.rect[2] - win.rect[0];
+                                            let ph = win.rect[3] - win.rect[1];
+                                            let lbl = format!(
+                                                "{}  ·  {} × {}",
+                                                ellipsize(&win.title, 34),
+                                                pw,
+                                                ph
+                                            );
+                                            let bw = (text_w(&p, &lbl, &semibold(12.0)) + 28.0)
+                                                .clamp(120.0, 380.0);
+                                            let badge_r = Rect::from_center_size(
+                                                pos2(
+                                                    wr.center().x,
+                                                    (wr.top() + 24.0).min(wr.center().y),
+                                                ),
+                                                vec2(bw, 28.0),
+                                            );
+                                            p.rect_filled(
+                                                badge_r,
+                                                CornerRadius::same(14),
+                                                Color32::from_black_alpha(215),
+                                            );
+                                            p.rect_stroke(
+                                                badge_r,
+                                                CornerRadius::same(14),
+                                                Stroke::new(1.0, ACCENT.gamma_multiply(0.6)),
+                                                StrokeKind::Inside,
+                                            );
+                                            p.text(
+                                                badge_r.center(),
+                                                Align2::CENTER_CENTER,
+                                                lbl,
+                                                semibold(12.0),
+                                                TEXT,
+                                            );
+
+                                            if ui.input(|i| i.pointer.primary_clicked())
+                                                && !over_bar
+                                            {
+                                                finish_crop = Some((CaptureMode::Window, win.rect));
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // 3. Bottom Floating Control Pill
+                                p.rect_filled(
+                                    bar_r,
+                                    CornerRadius::same(20),
+                                    Color32::from_rgba_unmultiplied(12, 13, 18, 235),
+                                );
+                                p.rect_stroke(
+                                    bar_r,
+                                    CornerRadius::same(20),
+                                    Stroke::new(1.0, BORDER),
+                                    StrokeKind::Inside,
+                                );
+
+                                let reg_btn = Rect::from_min_size(
+                                    pos2(bar_r.left() + 8.0, bar_r.top() + 6.0),
+                                    vec2(76.0, 28.0),
+                                );
+                                let win_btn = Rect::from_min_size(
+                                    pos2(bar_r.left() + 88.0, bar_r.top() + 6.0),
+                                    vec2(76.0, 28.0),
+                                );
+
+                                for (b_rect, m_val, m_lbl) in [
+                                    (reg_btn, CaptureMode::Region, "Region"),
+                                    (win_btn, CaptureMode::Window, "Window"),
+                                ] {
+                                    let active = mode == m_val;
+                                    let r_resp = btn_rect(ui, b_rect, ("ov_mode_btn", m_lbl));
+                                    p.rect_filled(
+                                        b_rect,
+                                        CornerRadius::same(14),
+                                        if active {
+                                            ACCENT.gamma_multiply(0.26)
+                                        } else if r_resp.hovered() {
+                                            Color32::from_rgb(28, 30, 38)
+                                        } else {
+                                            Color32::TRANSPARENT
+                                        },
+                                    );
+                                    p.text(
+                                        b_rect.center(),
+                                        Align2::CENTER_CENTER,
+                                        m_lbl,
+                                        semibold(11.5),
+                                        if active { TEXT } else { MUTED },
+                                    );
+                                    if r_resp.clicked() {
+                                        mode = m_val;
+                                        drag_start = None;
+                                        drag_cur = None;
+                                    }
+                                }
+
+                                p.text(
+                                    pos2(bar_r.right() - 16.0, bar_r.center().y),
+                                    Align2::RIGHT_CENTER,
+                                    "Space: Switch Mode  ·  Esc: Cancel",
+                                    FontId::proportional(11.0),
+                                    MUTED,
+                                );
+                            });
+                    },
+                );
+
+                if let Some((cap_mode, rect)) = finish_crop {
+                    self.overlay = OverlayPhase::Idle;
+                    if let Some((cw, ch, cropped)) = crop_desktop(&desktop, rect) {
+                        process_capture_async(
+                            ctx.clone(),
+                            self.screenshot.clone(),
+                            self.notifs.clone(),
+                            cap_mode,
+                            cw,
+                            ch,
+                            cropped,
+                        );
+                    }
+                } else if let Some(next) = next_overlay {
+                    self.overlay = next;
+                } else {
+                    self.overlay = OverlayPhase::Active {
+                        mode,
+                        desktop,
+                        drag_start,
+                        drag_cur,
+                    };
                 }
             }
         }

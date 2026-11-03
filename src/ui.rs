@@ -20,6 +20,7 @@ pub(crate) enum Section {
     Todo,
     Prayer,
     Antigravity,
+    Screenshot,
     Settings,
 }
 
@@ -341,6 +342,34 @@ pub(crate) fn tab_icon(ui: &mut Ui, sec: Section, label: &str, selected: bool) -
                 [pos2(c.x + 5.0, c.y), pos2(c.x + 6.5, c.y)],
                 Stroke::new(1.2, col),
             );
+        }
+        Section::Screenshot => {
+            // Camera / viewfinder icon
+            let body = Rect::from_center_size(c + vec2(0.0, 1.0), vec2(13.0, 9.5));
+            p.rect_stroke(body, CornerRadius::same(2), st, StrokeKind::Inside);
+            // top prism
+            p.line_segment(
+                [
+                    pos2(c.x - 3.0, body.top()),
+                    pos2(c.x - 1.8, body.top() - 2.0),
+                ],
+                st,
+            );
+            p.line_segment(
+                [
+                    pos2(c.x - 1.8, body.top() - 2.0),
+                    pos2(c.x + 1.8, body.top() - 2.0),
+                ],
+                st,
+            );
+            p.line_segment(
+                [
+                    pos2(c.x + 1.8, body.top() - 2.0),
+                    pos2(c.x + 3.0, body.top()),
+                ],
+                st,
+            );
+            p.circle_stroke(c + vec2(0.0, 1.0), 2.4, Stroke::new(1.3, col));
         }
         Section::Settings => {
             // gear
