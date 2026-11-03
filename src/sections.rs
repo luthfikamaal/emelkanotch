@@ -8,8 +8,8 @@ use crate::notification::activate_notif;
 use crate::prayer::{fmt_hm, prayer_color, prayer_icon, MAIN_PRAYERS, PRAYER_NAMES};
 use crate::screenshot::{
     capture_raw_desktop, copy_rgba_to_clipboard, crop_desktop, process_capture_async,
-    save_screenshot_settings, screenshots_dir, spawn_bg_image_picker, BgMode, CaptureMode,
-    OverlayPhase,
+    rerender_latest_async, save_screenshot_settings, screenshots_dir, spawn_bg_image_picker,
+    BgMode, CaptureMode, OverlayPhase, DEFAULT_PADDING, DEFAULT_ROUNDING, DEFAULT_SHADOW,
 };
 use crate::settings::{save_settings, NotchStyle};
 use crate::system::{fmt_due, fmt_gb};
@@ -2484,16 +2484,18 @@ impl EmelkaNotch {
             }
         }
 
-        ui.add_space(8.0);
+        ui.add_space(6.0);
 
-        // 2. Middle Bar: Background Mode (White / Image / Clear) + Set Background Image + Shadow
-        let (bar_rect, p) = card(ui, w, 36.0);
-        let (bg_mode, bg_path, shadow_enabled, picking_bg) = {
+        // 2. Middle Bar: Background Mode (White / Image / Clear) + Set Background Image + Reset
+        let (bar_rect, p) = card(ui, w, 34.0);
+        let (bg_mode, bg_path, mut padding, mut rounding, mut shadow, picking_bg) = {
             let st = self.screenshot.lock().unwrap();
             (
                 st.bg_mode,
                 st.bg_image_path.clone(),
-                st.shadow_enabled,
+                st.padding,
+                st.rounding,
+                st.shadow,
                 st.picking_bg,
             )
         };
@@ -2544,9 +2546,12 @@ impl EmelkaNotch {
                 if m == BgMode::Image && bg_path.is_none() {
                     spawn_bg_image_picker(ui.ctx().clone(), self.screenshot.clone());
                 } else {
-                    let mut st = self.screenshot.lock().unwrap();
-                    st.bg_mode = m;
-                    save_screenshot_settings(&st);
+                    {
+                        let mut st = self.screenshot.lock().unwrap();
+                        st.bg_mode = m;
+                        save_screenshot_settings(&st);
+                    }
+                    rerender_latest_async(ui.ctx().clone(), self.screenshot.clone());
                 }
             }
             x_cur += pill_w + 4.0;
@@ -2560,11 +2565,11 @@ impl EmelkaNotch {
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| "Custom BG".to_string());
-            format!("🖼 {}", ellipsize(&fname, 14))
+            format!("🖼 {}", ellipsize(&fname, 15))
         } else {
             "Set BG Image…".to_string()
         };
-        let bg_btn_w = 114.0;
+        let bg_btn_w = 122.0;
         let bg_btn_r = Rect::from_min_size(
             pos2(x_cur + 4.0, bar_rect.center().y - 11.0),
             vec2(bg_btn_w, 22.0),
@@ -2602,43 +2607,120 @@ impl EmelkaNotch {
             spawn_bg_image_picker(ui.ctx().clone(), self.screenshot.clone());
         }
 
-        // Shadow toggle on the right of the bar
-        let sh_w = 68.0;
-        let sh_r = Rect::from_min_size(
-            pos2(bar_rect.right() - sh_w - 10.0, bar_rect.center().y - 11.0),
-            vec2(sh_w, 22.0),
+        // Reset button on the right of the bar (resets Padding=54, Rounded=12, Shadow=19)
+        let is_default = (padding - DEFAULT_PADDING).abs() < 0.1
+            && (rounding - DEFAULT_ROUNDING).abs() < 0.1
+            && (shadow - DEFAULT_SHADOW).abs() < 0.1;
+        let rst_w = 58.0;
+        let rst_r = Rect::from_min_size(
+            pos2(bar_rect.right() - rst_w - 10.0, bar_rect.center().y - 11.0),
+            vec2(rst_w, 22.0),
         );
-        let sh_resp = btn_rect(ui, sh_r, "ss_shadow_toggle");
-        p.rect_filled(
-            sh_r,
-            CornerRadius::same(6),
-            if shadow_enabled {
-                GREEN.gamma_multiply(0.16)
-            } else {
-                Color32::from_rgb(20, 21, 27)
-            },
-        );
-        p.circle_filled(
-            pos2(sh_r.left() + 11.0, sh_r.center().y),
-            3.2,
-            if shadow_enabled { GREEN } else { DIM },
-        );
-        p.text(
-            pos2(sh_r.left() + 20.0, sh_r.center().y),
-            Align2::LEFT_CENTER,
-            "Shadow",
-            semibold(10.5),
-            if shadow_enabled { TEXT } else { MUTED },
-        );
-        if sh_resp.clicked() {
-            let mut st = self.screenshot.lock().unwrap();
-            st.shadow_enabled = !st.shadow_enabled;
-            save_screenshot_settings(&st);
+        if text_btn(ui, &p, rst_r, "Reset", "ss_reset_style", false, !is_default) {
+            padding = DEFAULT_PADDING;
+            rounding = DEFAULT_ROUNDING;
+            shadow = DEFAULT_SHADOW;
+            {
+                let mut st = self.screenshot.lock().unwrap();
+                st.padding = DEFAULT_PADDING;
+                st.rounding = DEFAULT_ROUNDING;
+                st.shadow = DEFAULT_SHADOW;
+                save_screenshot_settings(&st);
+            }
+            rerender_latest_async(ui.ctx().clone(), self.screenshot.clone());
         }
 
-        ui.add_space(8.0);
+        ui.add_space(6.0);
 
-        // 3. Bottom Row: Preview & Quick Actions Card
+        // 3. Sliders Row: Padding (default 54), Rounded (default 12), Shadow (default 19)
+        let (sl_rect, p) = card(ui, w, 38.0);
+        let col_w = (w - 24.0) / 3.0;
+        let mut style_changed = false;
+        let mut style_released = false;
+
+        let mut draw_slider =
+            |idx: usize, label: &str, val: &mut f32, min_v: f32, max_v: f32, id: &str| {
+                let x0 = sl_rect.left() + 12.0 + idx as f32 * col_w;
+                let x1 = x0 + col_w - if idx < 2 { 12.0 } else { 0.0 };
+                let top_y = sl_rect.top() + 11.0;
+                let bar_y = sl_rect.top() + 27.0;
+
+                p.text(
+                    pos2(x0, top_y),
+                    Align2::LEFT_CENTER,
+                    label,
+                    FontId::proportional(10.5),
+                    MUTED,
+                );
+                p.text(
+                    pos2(x1, top_y),
+                    Align2::RIGHT_CENTER,
+                    format!("{:.0}", *val),
+                    semibold(10.5),
+                    TEXT,
+                );
+
+                let hit_r = Rect::from_min_max(pos2(x0, bar_y - 7.0), pos2(x1, bar_y + 7.0));
+                let resp = ui
+                    .interact(
+                        hit_r,
+                        egui::Id::new(("ss_slider", id)),
+                        Sense::click_and_drag(),
+                    )
+                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+
+                if (resp.dragged() || resp.clicked()) && !busy {
+                    if let Some(pos) = resp.interact_pointer_pos() {
+                        let t = ((pos.x - x0) / (x1 - x0).max(1.0)).clamp(0.0, 1.0);
+                        let next = (min_v + t * (max_v - min_v)).round();
+                        if (next - *val).abs() >= 0.5 {
+                            *val = next;
+                            style_changed = true;
+                        }
+                    }
+                }
+                if resp.drag_stopped() || resp.clicked() {
+                    style_released = true;
+                }
+
+                let frac = ((*val - min_v) / (max_v - min_v).max(1.0)).clamp(0.0, 1.0);
+                let track_r = Rect::from_min_max(pos2(x0, bar_y - 2.0), pos2(x1, bar_y + 2.0));
+                p.rect_filled(track_r, CornerRadius::same(2), TRACK);
+                p.rect_filled(
+                    Rect::from_min_size(track_r.min, vec2(track_r.width() * frac, 4.0)),
+                    CornerRadius::same(2),
+                    ACCENT,
+                );
+                let knob_x = x0 + track_r.width() * frac;
+                p.circle_filled(
+                    pos2(knob_x, bar_y),
+                    if resp.hovered() || resp.dragged() {
+                        5.0
+                    } else {
+                        4.0
+                    },
+                    TEXT,
+                );
+            };
+
+        draw_slider(0, "Padding", &mut padding, 0.0, 120.0, "pad");
+        draw_slider(1, "Rounded", &mut rounding, 0.0, 36.0, "rad");
+        draw_slider(2, "Shadow", &mut shadow, 0.0, 40.0, "shd");
+
+        if style_changed {
+            let mut st = self.screenshot.lock().unwrap();
+            st.padding = padding;
+            st.rounding = rounding;
+            st.shadow = shadow;
+            save_screenshot_settings(&st);
+        }
+        if style_released {
+            rerender_latest_async(ui.ctx().clone(), self.screenshot.clone());
+        }
+
+        ui.add_space(6.0);
+
+        // 4. Bottom Row: Preview & Quick Actions Card
         let prev_h = ui.available_height().max(132.0);
         let (card_r, p) = card(ui, w, prev_h);
 
@@ -2694,7 +2776,7 @@ impl EmelkaNotch {
                 );
             }
         } else {
-            // Live style mockup when no screenshot has been taken yet
+            // Live style mockup reflecting Padding, Rounded, and Shadow sliders
             let mock_bg = thumb_rect.shrink(8.0);
             let bg_col = match bg_mode {
                 BgMode::White => Color32::from_rgb(245, 246, 250),
@@ -2702,15 +2784,27 @@ impl EmelkaNotch {
                 BgMode::Transparent => Color32::from_rgb(22, 24, 30),
             };
             p.rect_filled(mock_bg, CornerRadius::same(6), bg_col);
-            let win_r = Rect::from_center_size(mock_bg.center(), vec2(116.0, 64.0));
-            if shadow_enabled {
+            let pad_t = (padding / 120.0).clamp(0.0, 1.0);
+            let win_w = lerp(154.0, 88.0, pad_t);
+            let win_h = lerp(86.0, 48.0, pad_t);
+            let win_r = Rect::from_center_size(mock_bg.center(), vec2(win_w, win_h));
+            let mock_rad = ((rounding * 0.5).round() as u8).min(18);
+            if shadow > 0.5 {
+                let sh_t = (shadow / 40.0).clamp(0.0, 1.0);
+                let sh_alpha = (sh_t * 110.0).round() as u8;
                 p.rect_filled(
-                    win_r.translate(vec2(0.0, 4.0)).expand(3.0),
-                    CornerRadius::same(7),
-                    Color32::from_black_alpha(65),
+                    win_r
+                        .translate(vec2(0.0, 2.0 + sh_t * 4.0))
+                        .expand(1.5 + sh_t * 4.5),
+                    CornerRadius::same(mock_rad.saturating_add(2)),
+                    Color32::from_black_alpha(sh_alpha),
                 );
             }
-            p.rect_filled(win_r, CornerRadius::same(6), Color32::from_rgb(24, 26, 34));
+            p.rect_filled(
+                win_r,
+                CornerRadius::same(mock_rad),
+                Color32::from_rgb(24, 26, 34),
+            );
             // 3 window header dots in mockup
             p.circle_filled(
                 pos2(win_r.left() + 10.0, win_r.top() + 9.0),

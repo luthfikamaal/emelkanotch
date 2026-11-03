@@ -44,6 +44,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_EX_TOOLWINDOW,
 };
 
+pub(crate) const DEFAULT_PADDING: f32 = 54.0;
+pub(crate) const DEFAULT_ROUNDING: f32 = 12.0;
+pub(crate) const DEFAULT_SHADOW: f32 = 19.0;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum CaptureMode {
     Window,
@@ -74,6 +78,9 @@ pub(crate) struct RawDesktop {
 
 #[derive(Clone)]
 pub(crate) struct CaptureResult {
+    pub raw_rgba: Arc<Vec<u8>>,
+    pub raw_w: u32,
+    pub raw_h: u32,
     pub preview: Arc<egui::ColorImage>,
     pub rgba: Arc<Vec<u8>>,
     pub width: u32,
@@ -103,7 +110,9 @@ pub(crate) struct ScreenshotState {
     pub bg_mode: BgMode,
     pub bg_image_path: Option<String>,
     pub bg_image_cache: Option<(String, u32, u32, Arc<Vec<u8>>)>,
-    pub shadow_enabled: bool,
+    pub padding: f32,
+    pub rounding: f32,
+    pub shadow: f32,
     pub latest: Option<CaptureResult>,
     pub busy: bool,
     pub picking_bg: bool,
@@ -118,7 +127,9 @@ impl Default for ScreenshotState {
             bg_mode: BgMode::White,
             bg_image_path: None,
             bg_image_cache: None,
-            shadow_enabled: true,
+            padding: DEFAULT_PADDING,
+            rounding: DEFAULT_ROUNDING,
+            shadow: DEFAULT_SHADOW,
             latest: None,
             busy: false,
             picking_bg: false,
@@ -166,8 +177,16 @@ pub(crate) fn load_screenshot_state() -> ScreenshotState {
             _ => BgMode::White,
         };
     }
-    if let Some(sh) = v.get("shadow").and_then(|x| x.as_bool()) {
-        st.shadow_enabled = sh;
+    if let Some(pad) = v.get("padding").and_then(|x| x.as_f64()) {
+        st.padding = (pad as f32).clamp(0.0, 120.0);
+    }
+    if let Some(rad) = v.get("rounding").and_then(|x| x.as_f64()) {
+        st.rounding = (rad as f32).clamp(0.0, 36.0);
+    }
+    if let Some(sh) = v.get("shadow").and_then(|x| x.as_f64()) {
+        st.shadow = (sh as f32).clamp(0.0, 40.0);
+    } else if let Some(sh_bool) = v.get("shadow").and_then(|x| x.as_bool()) {
+        st.shadow = if sh_bool { DEFAULT_SHADOW } else { 0.0 };
     }
     if let Some(path) = v
         .get("bg_image_path")
@@ -198,7 +217,9 @@ pub(crate) fn save_screenshot_settings(st: &ScreenshotState) {
     let json = serde_json::json!({
         "bg_mode": mode_str,
         "bg_image_path": st.bg_image_path.as_deref().unwrap_or(""),
-        "shadow": st.shadow_enabled,
+        "padding": st.padding,
+        "rounding": st.rounding,
+        "shadow": st.shadow,
     });
     let _ = fs::write(p, json.to_string());
 }
@@ -284,13 +305,16 @@ pub(crate) fn spawn_bg_image_picker(ctx: egui::Context, state: Arc<Mutex<Screens
 
         if let Some(path) = picked {
             if let Some((w, h, rgba)) = decode_image_file(&path) {
-                let mut st = state.lock().unwrap();
-                st.bg_image_path = Some(path.clone());
-                st.bg_image_cache = Some((path, w, h, Arc::new(rgba)));
-                st.bg_mode = BgMode::Image;
-                st.status_msg = Some(("Background image updated".to_string(), Instant::now()));
-                st.picking_bg = false;
-                save_screenshot_settings(&st);
+                {
+                    let mut st = state.lock().unwrap();
+                    st.bg_image_path = Some(path.clone());
+                    st.bg_image_cache = Some((path, w, h, Arc::new(rgba)));
+                    st.bg_mode = BgMode::Image;
+                    st.status_msg = Some(("Background image updated".to_string(), Instant::now()));
+                    st.picking_bg = false;
+                    save_screenshot_settings(&st);
+                }
+                rerender_latest_async(ctx.clone(), state.clone());
             } else {
                 let mut st = state.lock().unwrap();
                 st.status_msg = Some(("Failed to decode image".to_string(), Instant::now()));
@@ -574,27 +598,35 @@ fn sample_bilinear(rgba: &[u8], w: u32, h: u32, u: f32, v: f32) -> [u8; 4] {
 /// Renders the final styled screenshot:
 /// - Background (Solid White default, Center-Cropped Custom Image, or Transparent)
 /// - Dual-layer Gaussian Drop Shadow (ambient + downward directional shadow)
-/// - Anti-aliased rounded corners (12px scaled) with subtle inner/outer border
+/// - Anti-aliased rounded corners with subtle inner/outer border
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn render_screenshot(
     src_rgba: &[u8],
     src_w: u32,
     src_h: u32,
     bg_mode: BgMode,
     bg_image: Option<(u32, u32, &[u8])>,
-    shadow_enabled: bool,
+    padding: f32,
+    rounding: f32,
+    shadow: f32,
 ) -> (u32, u32, Vec<u8>) {
     let scale = ((src_w.min(src_h) as f32) / 550.0).clamp(0.75, 2.0);
-    let radius = (12.0 * scale).round().min((src_w.min(src_h) as f32) * 0.25);
+    let radius = (rounding.max(0.0) * scale)
+        .round()
+        .min((src_w.min(src_h) as f32) * 0.25);
 
-    let (pad_x, pad_top, pad_bot) = if shadow_enabled || bg_mode != BgMode::Transparent {
-        (
-            (54.0 * scale).round() as u32,
-            (44.0 * scale).round() as u32,
-            (66.0 * scale).round() as u32,
-        )
-    } else {
-        (0, 0, 0)
-    };
+    let pad_ratio = (padding.max(0.0)) / DEFAULT_PADDING;
+    let shadow_active = shadow > 0.1;
+    let (pad_x, pad_top, pad_bot) =
+        if padding > 0.5 && (shadow_active || bg_mode != BgMode::Transparent) {
+            (
+                (54.0 * pad_ratio * scale).round() as u32,
+                (44.0 * pad_ratio * scale).round() as u32,
+                (66.0 * pad_ratio * scale).round() as u32,
+            )
+        } else {
+            (0, 0, 0)
+        };
 
     let out_w = src_w + pad_x * 2;
     let out_h = src_h + pad_top + pad_bot;
@@ -618,10 +650,12 @@ pub(crate) fn render_screenshot(
     let cx = pad_x as f32 + hx;
     let cy = pad_top as f32 + hy;
 
-    let key_off_y = 15.0 * scale;
-    let key_sigma = 19.0 * scale * 1.4142135;
-    let amb_off_y = 2.0 * scale;
-    let amb_sigma = 5.5 * scale * 1.4142135;
+    let sh_ratio = (shadow.max(0.0)) / DEFAULT_SHADOW;
+    let sh_strength = sh_ratio.clamp(0.0, 1.6);
+    let key_off_y = 15.0 * scale * sh_ratio;
+    let key_sigma = (19.0 * scale * sh_ratio * 1.4142135).max(0.001);
+    let amb_off_y = 2.0 * scale * sh_ratio;
+    let amb_sigma = (5.5 * scale * sh_ratio * 1.4142135).max(0.001);
 
     for y in 0..out_h {
         let py = y as f32 + 0.5;
@@ -649,12 +683,12 @@ pub(crate) fn render_screenshot(
             let sdf = rounded_box_sdf(px, py, cx, cy, hx, hy, radius);
 
             // 2. Dual-Layer Drop Shadow (evaluated outside and near the border)
-            if shadow_enabled && sdf > -1.5 {
+            if shadow_active && sdf > -1.5 {
                 let sdf_key = rounded_box_sdf(px, py - key_off_y, cx, cy, hx, hy, radius);
                 let sdf_amb = rounded_box_sdf(px, py - amb_off_y, cx, cy, hx, hy, radius);
 
-                let a_key = 0.165 * fast_erfc(sdf_key / key_sigma);
-                let a_amb = 0.075 * fast_erfc(sdf_amb / amb_sigma);
+                let a_key = 0.165 * sh_strength * fast_erfc(sdf_key / key_sigma);
+                let a_amb = 0.075 * sh_strength * fast_erfc(sdf_amb / amb_sigma);
                 let sh_a = (a_key + a_amb * (1.0 - a_key)).clamp(0.0, 1.0);
 
                 if base[3] == 255 {
@@ -778,10 +812,16 @@ pub(crate) fn process_capture_async(
     crop_h: u32,
     crop_rgba: Vec<u8>,
 ) {
-    let (bg_mode, shadow_enabled, bg_cache) = {
+    let (bg_mode, padding, rounding, shadow, bg_cache) = {
         let mut st = state.lock().unwrap();
         st.busy = true;
-        (st.bg_mode, st.shadow_enabled, st.bg_image_cache.clone())
+        (
+            st.bg_mode,
+            st.padding,
+            st.rounding,
+            st.shadow,
+            st.bg_image_cache.clone(),
+        )
     };
 
     thread::spawn(move || {
@@ -789,8 +829,9 @@ pub(crate) fn process_capture_async(
             .as_ref()
             .map(|(_, bw, bh, bpx)| (*bw, *bh, bpx.as_slice()));
 
-        let (out_w, out_h, out_rgba) =
-            render_screenshot(&crop_rgba, crop_w, crop_h, bg_mode, bg_ref, shadow_enabled);
+        let (out_w, out_h, out_rgba) = render_screenshot(
+            &crop_rgba, crop_w, crop_h, bg_mode, bg_ref, padding, rounding, shadow,
+        );
 
         let copied = copy_rgba_to_clipboard(out_w, out_h, &out_rgba);
         let saved_path = save_rgba_as_png(out_w, out_h, &out_rgba);
@@ -801,6 +842,9 @@ pub(crate) fn process_capture_async(
             let ver = st.next_ver;
             st.next_ver += 1;
             st.latest = Some(CaptureResult {
+                raw_rgba: Arc::new(crop_rgba),
+                raw_w: crop_w,
+                raw_h: crop_h,
                 preview,
                 rgba: Arc::new(out_rgba),
                 width: out_w,
@@ -834,6 +878,91 @@ pub(crate) fn process_capture_async(
     });
 }
 
+/// Re-renders the latest capture in-place when style settings (Padding, Rounded, Shadow, BG) change.
+pub(crate) fn rerender_latest_async(ctx: egui::Context, state: Arc<Mutex<ScreenshotState>>) {
+    let job = {
+        let mut st = state.lock().unwrap();
+        if st.busy {
+            return;
+        }
+        let Some(cap) = st.latest.clone() else {
+            return;
+        };
+        st.busy = true;
+        (
+            cap.raw_rgba.clone(),
+            cap.raw_w,
+            cap.raw_h,
+            cap.mode,
+            cap.saved_path.clone(),
+            cap.at,
+            st.bg_mode,
+            st.padding,
+            st.rounding,
+            st.shadow,
+            st.bg_image_cache.clone(),
+        )
+    };
+
+    thread::spawn(move || {
+        let (
+            raw_rgba,
+            raw_w,
+            raw_h,
+            mode,
+            saved_path,
+            at,
+            bg_mode,
+            padding,
+            rounding,
+            shadow,
+            bg_cache,
+        ) = job;
+        let bg_ref = bg_cache
+            .as_ref()
+            .map(|(_, bw, bh, bpx)| (*bw, *bh, bpx.as_slice()));
+
+        let (out_w, out_h, out_rgba) = render_screenshot(
+            &raw_rgba, raw_w, raw_h, bg_mode, bg_ref, padding, rounding, shadow,
+        );
+        let _ = copy_rgba_to_clipboard(out_w, out_h, &out_rgba);
+        if let Some(ref path) = saved_path {
+            if let Ok(file) = File::create(path) {
+                let writer = BufWriter::new(file);
+                let mut encoder = png::Encoder::new(writer, out_w, out_h);
+                encoder.set_color(png::ColorType::Rgba);
+                encoder.set_depth(png::BitDepth::Eight);
+                encoder.set_compression(png::Compression::Fast);
+                if let Ok(mut pw) = encoder.write_header() {
+                    let _ = pw.write_image_data(&out_rgba);
+                }
+            }
+        }
+        let preview = Arc::new(downscale_preview(&out_rgba, out_w, out_h, 420));
+
+        {
+            let mut st = state.lock().unwrap();
+            let ver = st.next_ver;
+            st.next_ver += 1;
+            st.latest = Some(CaptureResult {
+                raw_rgba,
+                raw_w,
+                raw_h,
+                preview,
+                rgba: Arc::new(out_rgba),
+                width: out_w,
+                height: out_h,
+                saved_path,
+                mode,
+                at,
+                ver,
+            });
+            st.busy = false;
+        }
+        ctx.request_repaint();
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -843,7 +972,16 @@ mod tests {
         let w = 200u32;
         let h = 120u32;
         let src = vec![40u8; (w * h * 4) as usize];
-        let (out_w, out_h, out) = render_screenshot(&src, w, h, BgMode::White, None, true);
+        let (out_w, out_h, out) = render_screenshot(
+            &src,
+            w,
+            h,
+            BgMode::White,
+            None,
+            DEFAULT_PADDING,
+            DEFAULT_ROUNDING,
+            DEFAULT_SHADOW,
+        );
         assert!(out_w > w && out_h > h);
         assert_eq!(out.len(), (out_w * out_h * 4) as usize);
         // Top-left corner of canvas should be white background (#FFFFFF)
@@ -856,8 +994,16 @@ mod tests {
         let h = 100u32;
         let src = vec![200u8; (w * h * 4) as usize];
         let bg = vec![80u8; 64 * 64 * 4];
-        let (out_w, out_h, out) =
-            render_screenshot(&src, w, h, BgMode::Image, Some((64, 64, &bg)), true);
+        let (out_w, out_h, out) = render_screenshot(
+            &src,
+            w,
+            h,
+            BgMode::Image,
+            Some((64, 64, &bg)),
+            DEFAULT_PADDING,
+            DEFAULT_ROUNDING,
+            DEFAULT_SHADOW,
+        );
         assert!(out_w > w && out_h > h);
         assert_eq!(out[0], 80);
         assert_eq!(out[3], 255);
