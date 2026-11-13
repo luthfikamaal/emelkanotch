@@ -445,7 +445,7 @@ pub(crate) fn draw_weather_panel(ui: &mut egui::Ui, s: &WeatherState) -> bool {
 
     let dim = Color32::from_rgb(140, 142, 154);
     let bright = Color32::from_rgb(238, 239, 245);
-    let card_bg = Color32::from_rgb(23, 27, 36);
+    let card_bg = Color32::from_rgb(0, 0, 0);
     let rain = Color32::from_rgb(96, 170, 255);
     let accent_soft = Color32::from_rgb(145, 185, 240);
     let mut retry = false;

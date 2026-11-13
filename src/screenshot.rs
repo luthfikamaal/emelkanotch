@@ -610,7 +610,7 @@ pub(crate) fn render_screenshot(
     rounding: f32,
     shadow: f32,
 ) -> (u32, u32, Vec<u8>) {
-    let scale = ((src_w.min(src_h) as f32) / 550.0).clamp(0.75, 2.0);
+    let scale = ((src_w.min(src_h) as f32) / 550.0).clamp(0.75, 4.0);
     let radius = (rounding.max(0.0) * scale)
         .round()
         .min((src_w.min(src_h) as f32) * 0.25);
@@ -801,6 +801,49 @@ fn save_rgba_as_png(w: u32, h: u32, rgba: &[u8]) -> Option<PathBuf> {
     Some(path)
 }
 
+/// Upscales an RGBA image by 2x using bilinear interpolation for high-DPI (2x Retina) quality.
+pub(crate) fn upscale_2x_bilinear(src: &[u8], w: u32, h: u32) -> (u32, u32, Vec<u8>) {
+    let out_w = w * 2;
+    let out_h = h * 2;
+    let mut out = vec![0u8; (out_w * out_h * 4) as usize];
+
+    for y in 0..out_h {
+        let v = (y as f32 + 0.5) * 0.5 - 0.5;
+        let y0 = (v.floor() as i32).clamp(0, h as i32 - 1) as u32;
+        let y1 = (y0 + 1).min(h - 1);
+        let ty = (v - y0 as f32).clamp(0.0, 1.0);
+
+        for x in 0..out_w {
+            let u = (x as f32 + 0.5) * 0.5 - 0.5;
+            let x0 = (u.floor() as i32).clamp(0, w as i32 - 1) as u32;
+            let x1 = (x0 + 1).min(w - 1);
+            let tx = (u - x0 as f32).clamp(0.0, 1.0);
+
+            let idx00 = ((y0 * w + x0) * 4) as usize;
+            let idx10 = ((y0 * w + x1) * 4) as usize;
+            let idx01 = ((y1 * w + x0) * 4) as usize;
+            let idx11 = ((y1 * w + x1) * 4) as usize;
+
+            let out_idx = ((y * out_w + x) * 4) as usize;
+
+            let w00 = (1.0 - tx) * (1.0 - ty);
+            let w10 = tx * (1.0 - ty);
+            let w01 = (1.0 - tx) * ty;
+            let w11 = tx * ty;
+
+            for c in 0..4 {
+                let val = src[idx00 + c] as f32 * w00
+                    + src[idx10 + c] as f32 * w10
+                    + src[idx01 + c] as f32 * w01
+                    + src[idx11 + c] as f32 * w11;
+                out[out_idx + c] = val.round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+
+    (out_w, out_h, out)
+}
+
 /// Processes a raw cropped region on a background thread, copies to Clipboard, saves PNG,
 /// updates preview state, and pushes a Notch notification.
 pub(crate) fn process_capture_async(
@@ -825,6 +868,7 @@ pub(crate) fn process_capture_async(
     };
 
     thread::spawn(move || {
+        let (crop_w, crop_h, crop_rgba) = upscale_2x_bilinear(&crop_rgba, crop_w, crop_h);
         let bg_ref = bg_cache
             .as_ref()
             .map(|(_, bw, bh, bpx)| (*bw, *bh, bpx.as_slice()));
@@ -1007,5 +1051,18 @@ mod tests {
         assert!(out_w > w && out_h > h);
         assert_eq!(out[0], 80);
         assert_eq!(out[3], 255);
+    }
+
+    #[test]
+    fn test_upscale_2x_bilinear() {
+        let w = 8u32;
+        let h = 6u32;
+        let src = vec![120u8; (w * h * 4) as usize];
+        let (out_w, out_h, out) = upscale_2x_bilinear(&src, w, h);
+        assert_eq!(out_w, 16);
+        assert_eq!(out_h, 12);
+        assert_eq!(out.len(), (16 * 12 * 4) as usize);
+        assert_eq!(out[0], 120);
+        assert_eq!(out[3], 120);
     }
 }

@@ -682,7 +682,7 @@ pub(crate) fn draw_prayer_panel(ui: &mut egui::Ui, s: &PrayerState) {
     };
     let next = next_prayer(s);
 
-    let base_bg = Color32::from_rgb(24, 24, 28);
+    let base_bg = Color32::from_rgb(0, 0, 0);
     let w = ui.available_width();
 
     // ----- header -----

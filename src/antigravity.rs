@@ -362,7 +362,7 @@ fn exchange_code_for_token(
 
 pub(crate) fn spawn_antigravity_worker(ctx: egui::Context, state: Arc<Mutex<AntigravityState>>) {
     thread::spawn(move || {
-        let mut last_fetch = Instant::now() - Duration::from_secs(600);
+        let mut last_fetch: Option<Instant> = None;
 
         loop {
             let (do_login, do_logout, do_refresh) = {
@@ -391,8 +391,8 @@ pub(crate) fn spawn_antigravity_worker(ctx: egui::Context, state: Arc<Mutex<Anti
             }
 
             // Periodic or manual fetch
-            if do_refresh || last_fetch.elapsed() > Duration::from_secs(60) {
-                last_fetch = Instant::now();
+            if do_refresh || last_fetch.map_or(true, |t| t.elapsed() > Duration::from_secs(60)) {
+                last_fetch = Some(Instant::now());
 
                 let email = detect_logged_in_email()
                     .unwrap_or_else(|| "luthfikamal13@gmail.com".to_string());
