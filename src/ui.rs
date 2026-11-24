@@ -37,6 +37,7 @@ pub(crate) fn card(ui: &mut Ui, w: f32, h: f32) -> (Rect, Painter) {
     (rect, p)
 }
 
+#[allow(dead_code)]
 pub(crate) fn card_header(p: &Painter, r: Rect, title: &str, value: &str) {
     p.text(
         pos2(r.left() + 12.0, r.top() + 16.0),
@@ -54,6 +55,7 @@ pub(crate) fn card_header(p: &Painter, r: Rect, title: &str, value: &str) {
     );
 }
 
+#[allow(dead_code)]
 pub(crate) fn sparkline(p: &Painter, r: Rect, data: &VecDeque<f32>, color: Color32) {
     for f in [0.25, 0.5, 0.75] {
         let y = r.bottom() - r.height() * f;
@@ -399,6 +401,7 @@ pub(crate) enum Icon {
     Pause,
 }
 
+#[allow(dead_code)]
 pub(crate) fn icon_button(ui: &mut Ui, icon: Icon, size: f32, primary: bool) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(size, size), Sense::click());
     let p = ui.painter();
@@ -460,6 +463,7 @@ pub(crate) fn icon_button(ui: &mut Ui, icon: Icon, size: f32, primary: bool) -> 
 }
 
 /// Thin horizontal bar. Returns the response so callers can handle clicks.
+#[allow(dead_code)]
 pub(crate) fn bar(ui: &mut Ui, width: f32, frac: f32, fill: Color32) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(width, 14.0), Sense::click());
     let track = Rect::from_center_size(rect.center(), vec2(rect.width(), 4.0));

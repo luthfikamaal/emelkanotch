@@ -11,7 +11,9 @@ use crate::screenshot::{
     rerender_latest_async, save_screenshot_settings, screenshots_dir, spawn_bg_image_picker,
     BgMode, CaptureMode, OverlayPhase, DEFAULT_PADDING, DEFAULT_ROUNDING, DEFAULT_SHADOW,
 };
-use crate::settings::{save_settings, NotchStyle};
+use crate::settings::{
+    save_settings, AppSettings, NotchStyle, MAX_REVEAL_HEIGHT, MIN_REVEAL_HEIGHT,
+};
 use crate::system::{fmt_due, fmt_gb};
 use crate::tasks::{save_todos, Todo};
 use crate::theme::*;
@@ -150,7 +152,12 @@ impl EmelkaNotch {
 
             if resp.clicked() && self.style != *st {
                 self.style = *st;
-                crate::settings::save_settings(self.style, self.osd_enabled);
+                save_settings(AppSettings {
+                    style: self.style,
+                    osd: self.osd_enabled,
+                    auto_hide: self.auto_hide,
+                    reveal_height: self.reveal_height,
+                });
             }
         }
 
@@ -193,7 +200,184 @@ impl EmelkaNotch {
         );
         if resp.clicked() {
             self.osd_enabled = !self.osd_enabled;
-            save_settings(self.style, self.osd_enabled);
+            save_settings(AppSettings {
+                style: self.style,
+                osd: self.osd_enabled,
+                auto_hide: self.auto_hide,
+                reveal_height: self.reveal_height,
+            });
+        }
+
+        // ---- Auto-hide notch toggle ----
+        ui.add_space(6.0);
+        let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 28.0), Sense::hover());
+        let resp = btn_rect(ui, row, "autohide_toggle");
+        let p = ui.painter().clone();
+        p.rect_filled(
+            row,
+            CornerRadius::same(10),
+            if resp.hovered() {
+                field_fill(true, false)
+            } else {
+                CARD
+            },
+        );
+        p.rect_stroke(
+            row,
+            CornerRadius::same(10),
+            Stroke::new(1.0, BORDER),
+            StrokeKind::Inside,
+        );
+        p.text(
+            pos2(row.left() + 12.0, row.center().y),
+            Align2::LEFT_CENTER,
+            "Auto-hide notch (reveal from top on hover)",
+            semibold(11.5),
+            TEXT,
+        );
+        let k = ui
+            .ctx()
+            .animate_bool_with_time(egui::Id::new("autohide_sw"), self.auto_hide, 0.15);
+        let sw = Rect::from_center_size(pos2(row.right() - 27.0, row.center().y), vec2(30.0, 16.0));
+        p.rect_filled(sw, CornerRadius::same(8), TRACK.lerp_to_gamma(ACCENT, k));
+        p.circle_filled(
+            pos2(lerp(sw.left() + 8.0, sw.right() - 8.0, k), sw.center().y),
+            5.5,
+            TEXT,
+        );
+        if resp.clicked() {
+            self.auto_hide = !self.auto_hide;
+            save_settings(AppSettings {
+                style: self.style,
+                osd: self.osd_enabled,
+                auto_hide: self.auto_hide,
+                reveal_height: self.reveal_height,
+            });
+        }
+
+        // ---- Reveal trigger height ----
+        ui.add_space(6.0);
+        let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 28.0), Sense::hover());
+        let p = ui.painter().clone();
+        p.rect_filled(row, CornerRadius::same(10), CARD);
+        p.rect_stroke(
+            row,
+            CornerRadius::same(10),
+            Stroke::new(1.0, BORDER),
+            StrokeKind::Inside,
+        );
+        let enabled = self.auto_hide;
+        p.text(
+            pos2(row.left() + 12.0, row.center().y),
+            Align2::LEFT_CENTER,
+            "Top hover trigger height",
+            semibold(11.5),
+            if enabled { TEXT } else { DIM },
+        );
+
+        let ctrl = Rect::from_center_size(
+            pos2(row.right() - 56.0, row.center().y),
+            vec2(96.0, 22.0),
+        );
+        p.rect_filled(
+            ctrl,
+            CornerRadius::same(6),
+            if enabled {
+                field_fill(ui.rect_contains_pointer(ctrl), false)
+            } else {
+                Color32::from_rgb(14, 15, 19)
+            },
+        );
+        let minus = Rect::from_min_size(ctrl.min, vec2(26.0, ctrl.height()));
+        let plus = Rect::from_min_size(
+            pos2(ctrl.right() - 26.0, ctrl.top()),
+            vec2(26.0, ctrl.height()),
+        );
+        let mut delta = 0.0f32;
+        if enabled {
+            if btn_rect(ui, minus, "rh_minus").clicked() {
+                delta = -2.0;
+            }
+            if btn_rect(ui, plus, "rh_plus").clicked() {
+                delta = 2.0;
+            }
+            if ui.rect_contains_pointer(ctrl) {
+                let dy = ui.input(|i| i.raw_scroll_delta.y);
+                if dy > 0.0 {
+                    delta = 2.0;
+                } else if dy < 0.0 {
+                    delta = -2.0;
+                }
+            }
+        }
+        if delta != 0.0 {
+            let next = (self.reveal_height + delta).clamp(MIN_REVEAL_HEIGHT, MAX_REVEAL_HEIGHT);
+            if (next - self.reveal_height).abs() > 0.01 {
+                self.reveal_height = next;
+                save_settings(AppSettings {
+                    style: self.style,
+                    osd: self.osd_enabled,
+                    auto_hide: self.auto_hide,
+                    reveal_height: self.reveal_height,
+                });
+            }
+        }
+        let st = Stroke::new(1.3, if enabled { MUTED } else { DIM });
+        let mc = minus.center();
+        p.line_segment([mc - vec2(3.5, 0.0), mc + vec2(3.5, 0.0)], st);
+        let pc = plus.center();
+        p.line_segment([pc - vec2(3.5, 0.0), pc + vec2(3.5, 0.0)], st);
+        p.line_segment([pc - vec2(0.0, 3.5), pc + vec2(0.0, 3.5)], st);
+        p.text(
+            ctrl.center(),
+            Align2::CENTER_CENTER,
+            format!("{} px", self.reveal_height.round() as i32),
+            semibold(11.0),
+            if enabled { TEXT } else { DIM },
+        );
+
+        // ---- Launch at Windows startup toggle ----
+        ui.add_space(6.0);
+        let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 28.0), Sense::hover());
+        let resp = btn_rect(ui, row, "autostart_toggle");
+        let p = ui.painter().clone();
+        p.rect_filled(
+            row,
+            CornerRadius::same(10),
+            if resp.hovered() {
+                field_fill(true, false)
+            } else {
+                CARD
+            },
+        );
+        p.rect_stroke(
+            row,
+            CornerRadius::same(10),
+            Stroke::new(1.0, BORDER),
+            StrokeKind::Inside,
+        );
+        p.text(
+            pos2(row.left() + 12.0, row.center().y),
+            Align2::LEFT_CENTER,
+            "Launch at Windows startup",
+            semibold(11.5),
+            TEXT,
+        );
+        let k = ui
+            .ctx()
+            .animate_bool_with_time(egui::Id::new("autostart_sw"), self.autostart, 0.15);
+        let sw = Rect::from_center_size(pos2(row.right() - 27.0, row.center().y), vec2(30.0, 16.0));
+        p.rect_filled(sw, CornerRadius::same(8), TRACK.lerp_to_gamma(ACCENT, k));
+        p.circle_filled(
+            pos2(lerp(sw.left() + 8.0, sw.right() - 8.0, k), sw.center().y),
+            5.5,
+            TEXT,
+        );
+        if resp.clicked() {
+            let next = !self.autostart;
+            if crate::settings::set_autostart(next) {
+                self.autostart = next;
+            }
         }
     }
 
@@ -613,6 +797,128 @@ impl EmelkaNotch {
         }
     }
 
+    fn media_accent(&mut self, art: &Option<std::sync::Arc<egui::ColorImage>>, art_ver: u64) -> Color32 {
+        if art_ver == self.art_accent.0 && art_ver != 0 {
+            return self.art_accent.1;
+        }
+        let Some(img) = art else {
+            self.art_accent = (0, ACCENT);
+            return ACCENT;
+        };
+        let mut r_sum = 0.0f32;
+        let mut g_sum = 0.0f32;
+        let mut b_sum = 0.0f32;
+        let mut w_sum = 0.0f32;
+        for px in img.pixels.iter().step_by(4) {
+            let r = px.r() as f32 / 255.0;
+            let g = px.g() as f32 / 255.0;
+            let b = px.b() as f32 / 255.0;
+            let maxc = r.max(g).max(b);
+            let minc = r.min(g).min(b);
+            let sat = if maxc > 0.001 { (maxc - minc) / maxc } else { 0.0 };
+            if maxc < 0.14 || maxc > 0.96 {
+                continue;
+            }
+            let weight = 0.25 + sat * sat * 2.5;
+            r_sum += r * weight;
+            g_sum += g * weight;
+            b_sum += b * weight;
+            w_sum += weight;
+        }
+        let col = if w_sum > 0.01 {
+            let mut r = r_sum / w_sum;
+            let mut g = g_sum / w_sum;
+            let mut b = b_sum / w_sum;
+            // Lift dark accents so they stay crisp & readable on dark OLED surfaces
+            let maxc = r.max(g).max(b).max(0.01);
+            if maxc < 0.58 {
+                let scale = 0.68 / maxc;
+                r = (r * scale).min(1.0);
+                g = (g * scale).min(1.0);
+                b = (b * scale).min(1.0);
+            }
+            // Gently boost vibrancy without neon clipping
+            let avg = (r + g + b) / 3.0;
+            r = (avg + (r - avg) * 1.25).clamp(0.18, 0.95);
+            g = (avg + (g - avg) * 1.25).clamp(0.18, 0.95);
+            b = (avg + (b - avg) * 1.25).clamp(0.18, 0.95);
+            Color32::from_rgb(
+                (r * 255.0).round() as u8,
+                (g * 255.0).round() as u8,
+                (b * 255.0).round() as u8,
+            )
+        } else {
+            ACCENT
+        };
+        self.art_accent = (art_ver, col);
+        col
+    }
+
+    fn paint_media_hero(
+        p: &egui::Painter,
+        rect: Rect,
+        radius: f32,
+        accent: Color32,
+        light_pos: egui::Pos2,
+    ) {
+        use std::f32::consts::{FRAC_PI_2, PI};
+        let r = radius.min(rect.width() * 0.5).min(rect.height() * 0.5);
+        let segs = 8usize;
+        let corners = [
+            (pos2(rect.right() - r, rect.top() + r), -FRAC_PI_2, 0.0),
+            (pos2(rect.right() - r, rect.bottom() - r), 0.0, FRAC_PI_2),
+            (pos2(rect.left() + r, rect.bottom() - r), FRAC_PI_2, PI),
+            (pos2(rect.left() + r, rect.top() + r), PI, PI + FRAC_PI_2),
+        ];
+
+        let base_top = Color32::from_rgb(16, 18, 26);
+        let base_bot = Color32::from_rgb(10, 11, 16);
+        let sample = |pt: egui::Pos2| {
+            let ty = ((pt.y - rect.top()) / rect.height().max(1.0)).clamp(0.0, 1.0);
+            let base = base_top.lerp_to_gamma(base_bot, ty);
+            let dist = (pt - light_pos).length() / 230.0;
+            let glow = (1.0 - dist).clamp(0.0, 1.0).powi(2) * 0.34;
+            base.lerp_to_gamma(accent, glow)
+        };
+
+        let mut perim = Vec::with_capacity(corners.len() * (segs + 1));
+        for (center, a0, a1) in corners {
+            for s in 0..=segs {
+                let a = a0 + (a1 - a0) * (s as f32 / segs as f32);
+                perim.push(pos2(center.x + r * a.cos(), center.y + r * a.sin()));
+            }
+        }
+        let mut mesh = egui::Mesh::default();
+        let c = rect.center();
+        mesh.colored_vertex(c, sample(c));
+        for &pt in &perim {
+            mesh.colored_vertex(pt, sample(pt));
+        }
+        let n = perim.len() as u32;
+        for i in 0..n {
+            let next = if i + 1 == n { 1 } else { i + 2 };
+            mesh.add_triangle(0, i + 1, next);
+        }
+        p.add(egui::Shape::mesh(mesh));
+    }
+
+    fn cover_uv(tex_size: egui::Vec2, target_size: egui::Vec2) -> Rect {
+        if tex_size.x <= 0.0 || tex_size.y <= 0.0 || target_size.x <= 0.0 || target_size.y <= 0.0 {
+            return Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+        }
+        let tex_ar = tex_size.x / tex_size.y;
+        let dst_ar = target_size.x / target_size.y;
+        if tex_ar > dst_ar {
+            let keep = dst_ar / tex_ar;
+            let m = (1.0 - keep) * 0.5;
+            Rect::from_min_max(pos2(m, 0.0), pos2(1.0 - m, 1.0))
+        } else {
+            let keep = tex_ar / dst_ar;
+            let m = (1.0 - keep) * 0.5;
+            Rect::from_min_max(pos2(0.0, m), pos2(1.0, 1.0 - m))
+        }
+    }
+
     pub(crate) fn media_section(
         &mut self,
         ui: &mut Ui,
@@ -620,39 +926,58 @@ impl EmelkaNotch {
         pos_ms: u64,
         lyrics: &Lyrics,
     ) {
+        ui.spacing_mut().item_spacing.y = 0.0;
+        let w = ui.available_width();
+
         if !media.available {
-            ui.add_space(26.0);
-            ui.vertical_centered(|ui| {
-                ui.label(
-                    egui::RichText::new("Nothing playing")
-                        .font(semibold(14.0))
-                        .color(TEXT),
-                );
-                ui.add_space(2.0);
-                ui.label(small(
-                    "Play something in Spotify, YouTube Music (Chrome), etc.".into(),
-                ));
-            });
+            let (card, _) = ui.allocate_exact_size(vec2(w, 178.0), Sense::hover());
+            let p = ui.painter().clone();
+            p.rect_filled(card, CornerRadius::same(16), Color32::from_rgb(11, 13, 19));
+            p.rect_stroke(
+                card,
+                CornerRadius::same(16),
+                Stroke::new(1.0, Color32::from_rgb(30, 34, 46)),
+                StrokeKind::Inside,
+            );
+            let vc = pos2(card.center().x, card.center().y - 24.0);
+            p.circle_filled(vc, 22.0, Color32::from_rgb(18, 21, 30));
+            p.circle_stroke(vc, 22.0, Stroke::new(1.0, Color32::from_rgb(42, 46, 62)));
+            p.circle_stroke(vc, 14.0, Stroke::new(0.8, Color32::from_rgb(32, 36, 48)));
+            p.circle_filled(vc, 5.5, Color32::from_rgb(36, 42, 58));
+            p.circle_filled(vc, 2.0, Color32::from_rgb(11, 13, 19));
+            p.text(
+                pos2(card.center().x, card.center().y + 14.0),
+                Align2::CENTER_CENTER,
+                "Nothing playing",
+                semibold(14.0),
+                TEXT,
+            );
+            p.text(
+                pos2(card.center().x, card.center().y + 33.0),
+                Align2::CENTER_CENTER,
+                "Play music in Spotify, YouTube Music, or Chrome",
+                FontId::proportional(11.0),
+                MUTED,
+            );
             return;
         }
 
-        // ---- baris atas: cover (kalau ada) + teks di kiri, kontrol di kanan ----
-        const ART: f32 = 50.0;
-        let width = ui.available_width();
         let app = media::app_label(&media.app);
+        let artist = media.artist.trim();
         let album = media.album.trim();
-        // Baris ke-3: "Album · App" (atau hanya App kalau album tidak tersedia).
-        let meta = if album.is_empty() {
-            app
-        } else {
-            format!("{album} · {app}")
+        let sub_line = match (artist.is_empty(), album.is_empty()) {
+            (false, false) => format!("{artist} · {album}"),
+            (false, true) => artist.to_string(),
+            (true, false) => album.to_string(),
+            (true, true) => app.clone(),
         };
 
-        // Cover: tekstur di-cache per versi cover; yang lama dibuang supaya tidak menumpuk.
+        // Cover art texture + cached dominant accent color
         let (art, art_ver) = {
             let sh = self.shared.lock().unwrap();
             (sh.art.clone(), sh.art_ver)
         };
+        let accent = self.media_accent(&art, art_ver);
         let art_tex = art.and_then(|img| {
             let id = format!("art:{art_ver}");
             if !self.textures.contains_key(&id) {
@@ -660,97 +985,328 @@ impl EmelkaNotch {
             }
             self.icon_tex(ui.ctx(), &id, &Some(img))
         });
-        let has_art = art_tex.is_some();
-        let text_w_max = width - 130.0 - if has_art { ART + 10.0 } else { 0.0 };
-        let (n_title, n_artist, n_meta) = if has_art { (28, 38, 42) } else { (36, 48, 52) };
 
-        ui.horizontal(|ui| {
-            if let Some(tex) = &art_tex {
-                let (r, _) = ui.allocate_exact_size(vec2(ART, ART), Sense::hover());
-                egui::Image::new(egui::load::SizedTexture::new(tex.id(), r.size()))
-                    .corner_radius(CornerRadius::same(8))
-                    .paint_at(ui, r);
-            }
-            ui.vertical(|ui| {
-                ui.set_width(text_w_max);
-                ui.spacing_mut().item_spacing.y = 1.0;
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(ellipsize(&media.title, n_title))
-                            .font(semibold(15.0))
-                            .color(TEXT),
-                    )
-                    .wrap_mode(egui::TextWrapMode::Extend),
+        // ================= 1. AMBIENT NOW PLAYING CARD =================
+        let hero_h = 124.0;
+        let (hero, _) = ui.allocate_exact_size(vec2(w, hero_h), Sense::hover());
+        let p = ui.painter().clone();
+        let art_size = 64.0;
+        let art_rect = Rect::from_min_size(
+            pos2(hero.left() + 14.0, hero.top() + 14.0),
+            vec2(art_size, art_size),
+        );
+        Self::paint_media_hero(&p, hero, 16.0, accent, art_rect.center());
+        p.rect_stroke(
+            hero,
+            CornerRadius::same(16),
+            Stroke::new(1.0, accent.gamma_multiply(0.28).lerp_to_gamma(BORDER, 0.45)),
+            StrokeKind::Inside,
+        );
+
+        // Cover art with center-crop UV (never stretched) or bespoke vinyl fallback
+        if let Some(tex) = &art_tex {
+            let uv = Self::cover_uv(tex.size_vec2(), art_rect.size());
+            egui::Image::new(egui::load::SizedTexture::new(tex.id(), art_rect.size()))
+                .uv(uv)
+                .corner_radius(CornerRadius::same(11))
+                .paint_at(ui, art_rect);
+            p.rect_stroke(
+                art_rect,
+                CornerRadius::same(11),
+                Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 38)),
+                StrokeKind::Inside,
+            );
+        } else {
+            p.rect_filled(art_rect, CornerRadius::same(11), Color32::from_rgb(16, 18, 26));
+            p.rect_stroke(
+                art_rect,
+                CornerRadius::same(11),
+                Stroke::new(1.0, Color32::from_rgb(42, 46, 60)),
+                StrokeKind::Inside,
+            );
+            let vc = art_rect.center();
+            p.circle_filled(vc, 22.0, Color32::from_rgb(11, 13, 18));
+            p.circle_stroke(vc, 17.0, Stroke::new(0.9, Color32::from_rgb(36, 40, 54)));
+            p.circle_stroke(vc, 12.0, Stroke::new(0.8, Color32::from_rgb(30, 34, 46)));
+            p.circle_filled(vc, 7.0, accent.gamma_multiply(0.85));
+            p.circle_filled(vc, 2.2, Color32::from_rgb(11, 13, 18));
+        }
+
+        // Source chip (top-right) with live mini equalizer
+        let time = ui.input(|i| i.time) as f32;
+        let app_font = semibold(10.0);
+        let (app_short, app_w) = fit(&p, &app, app_font.clone(), 86.0);
+        let chip_w = 18.0 + app_w + 10.0;
+        let chip_r = Rect::from_min_size(
+            pos2(hero.right() - 14.0 - chip_w, hero.top() + 14.0),
+            vec2(chip_w, 20.0),
+        );
+        p.rect_filled(
+            chip_r,
+            CornerRadius::same(10),
+            Color32::from_rgba_unmultiplied(8, 10, 16, 150),
+        );
+        p.rect_stroke(
+            chip_r,
+            CornerRadius::same(10),
+            Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 24)),
+            StrokeKind::Inside,
+        );
+        for i in 0..3 {
+            let bh = if media.playing {
+                3.0 + 6.0 * ((time * 7.2 + i as f32 * 1.9).sin() * 0.5 + 0.5)
+            } else {
+                3.0
+            };
+            let bx = chip_r.left() + 7.5 + i as f32 * 3.0;
+            let bar_r = Rect::from_center_size(pos2(bx, chip_r.center().y), vec2(1.8, bh));
+            p.rect_filled(
+                bar_r,
+                CornerRadius::same(1),
+                if media.playing { accent } else { DIM },
+            );
+        }
+        p.text(
+            pos2(chip_r.left() + 18.0, chip_r.center().y),
+            Align2::LEFT_CENTER,
+            &app_short,
+            app_font,
+            Color32::from_rgba_unmultiplied(226, 232, 246, 210),
+        );
+
+        // Track title + artist
+        let tx = art_rect.right() + 13.0;
+        let title_max_w = (chip_r.left() - 10.0 - tx).max(120.0);
+        let title_font = semibold(15.5);
+        let (title_fit, _) = fit(&p, &media.title, title_font.clone(), title_max_w);
+        p.text(
+            pos2(tx, hero.top() + 24.0),
+            Align2::LEFT_CENTER,
+            title_fit,
+            title_font,
+            TEXT,
+        );
+
+        // Transport controls (bottom-right of upper block)
+        let ctrl_y = hero.top() + 58.0;
+        let next_r = Rect::from_center_size(pos2(hero.right() - 28.0, ctrl_y), vec2(28.0, 28.0));
+        let play_r = Rect::from_center_size(pos2(hero.right() - 64.0, ctrl_y), vec2(34.0, 34.0));
+        let prev_r = Rect::from_center_size(pos2(hero.right() - 100.0, ctrl_y), vec2(28.0, 28.0));
+
+        let sub_max_w = (prev_r.left() - 12.0 - tx).max(100.0);
+        let sub_font = FontId::proportional(11.5);
+        let (sub_fit, _) = fit(&p, &sub_line, sub_font.clone(), sub_max_w);
+        p.text(
+            pos2(tx, hero.top() + 46.0),
+            Align2::LEFT_CENTER,
+            sub_fit,
+            sub_font,
+            Color32::from_rgba_unmultiplied(212, 220, 238, 195),
+        );
+        p.text(
+            pos2(tx, hero.top() + 65.0),
+            Align2::LEFT_CENTER,
+            if media.playing { "Now Playing" } else { "Paused" },
+            FontId::proportional(10.0),
+            if media.playing {
+                accent.gamma_multiply(0.9)
+            } else {
+                DIM
+            },
+        );
+
+        // Draw transport buttons inside hero
+        let draw_ctrl = |ui: &mut Ui, r: Rect, icon: Icon, primary: bool, id: &str| -> bool {
+            let resp = btn_rect(ui, r, id);
+            let c = r.center();
+            let sz = r.width();
+            let p = ui.painter();
+            if primary {
+                let fill = if resp.hovered() {
+                    Color32::WHITE
+                } else {
+                    Color32::from_rgb(236, 239, 246)
+                };
+                p.circle_filled(c, sz * 0.5, fill);
+            } else if resp.hovered() {
+                p.circle_filled(
+                    c,
+                    sz * 0.5,
+                    Color32::from_rgba_unmultiplied(255, 255, 255, 24),
                 );
-                if !media.artist.trim().is_empty() {
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(ellipsize(media.artist.trim(), n_artist))
-                                .size(12.0)
-                                .color(MUTED),
-                        )
-                        .wrap_mode(egui::TextWrapMode::Extend),
+            }
+            let col = if primary {
+                Color32::from_rgb(10, 11, 16)
+            } else if resp.hovered() {
+                Color32::WHITE
+            } else {
+                Color32::from_rgb(210, 216, 232)
+            };
+            let s = sz * 0.2;
+            let tri = |dir: f32, cx: f32| {
+                egui::Shape::convex_polygon(
+                    vec![
+                        pos2(cx - dir * s * 0.9, c.y - s),
+                        pos2(cx - dir * s * 0.9, c.y + s),
+                        pos2(cx + dir * s * 0.9, c.y),
+                    ],
+                    col,
+                    Stroke::NONE,
+                )
+            };
+            let bar_fn = |cx: f32, bw: f32| {
+                p.rect_filled(
+                    Rect::from_center_size(pos2(cx, c.y), vec2(bw, s * 2.0)),
+                    CornerRadius::same(1),
+                    col,
+                );
+            };
+            match icon {
+                Icon::Play => {
+                    p.add(tri(1.0, c.x + s * 0.15));
+                }
+                Icon::Pause => {
+                    bar_fn(c.x - s * 0.55, s * 0.58);
+                    bar_fn(c.x + s * 0.55, s * 0.58);
+                }
+                Icon::Next => {
+                    p.add(tri(1.0, c.x - s * 0.35));
+                    bar_fn(c.x + s * 0.95, s * 0.35);
+                }
+                Icon::Prev => {
+                    p.add(tri(-1.0, c.x + s * 0.35));
+                    bar_fn(c.x - s * 0.95, s * 0.35);
+                }
+            }
+            resp.clicked()
+        };
+
+        if draw_ctrl(ui, prev_r, Icon::Prev, false, "med_prev") {
+            let _ = self.tx.send(media::Cmd::Prev);
+        }
+        let play_icon = if media.playing {
+            Icon::Pause
+        } else {
+            Icon::Play
+        };
+        if draw_ctrl(ui, play_r, play_icon, true, "med_play") {
+            let _ = self.tx.send(media::Cmd::PlayPause);
+        }
+        if draw_ctrl(ui, next_r, Icon::Next, false, "med_next") {
+            let _ = self.tx.send(media::Cmd::Next);
+        }
+
+        // ---- Interactive Scrubber Bar inside bottom of hero ----
+        let scrub_rect = Rect::from_min_max(
+            pos2(hero.left() + 14.0, hero.top() + 87.0),
+            pos2(hero.right() - 14.0, hero.top() + 103.0),
+        );
+        let scrub_resp = ui
+            .interact(scrub_rect, ui.id().with("med_scrub"), Sense::click_and_drag())
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        let frac = if media.dur_ms > 0 {
+            (pos_ms as f32 / media.dur_ms as f32).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let scrubbing = scrub_resp.hovered() || scrub_resp.dragged();
+        let track_h = if scrubbing { 5.5 } else { 4.0 };
+        let track = Rect::from_center_size(scrub_rect.center(), vec2(scrub_rect.width(), track_h));
+        let p = ui.painter().clone();
+        p.rect_filled(
+            track,
+            CornerRadius::same(3),
+            Color32::from_rgba_unmultiplied(255, 255, 255, 26),
+        );
+        let fill_w = track.width() * frac;
+        if fill_w > 0.5 {
+            p.rect_filled(
+                Rect::from_min_size(track.min, vec2(fill_w, track_h)),
+                CornerRadius::same(3),
+                accent.lerp_to_gamma(Color32::WHITE, 0.35),
+            );
+        }
+        if scrubbing {
+            let knob_x = track.left() + fill_w;
+            p.circle_filled(pos2(knob_x, track.center().y), 5.2, Color32::WHITE);
+            if media.dur_ms > 0 {
+                if let Some(hp) = scrub_resp.hover_pos() {
+                    let hf = ((hp.x - track.left()) / track.width()).clamp(0.0, 1.0);
+                    let h_ms = (hf * media.dur_ms as f32) as u64;
+                    let tip = media::fmt_time(h_ms);
+                    let tip_x = hp.x.clamp(track.left() + 18.0, track.right() - 18.0);
+                    let tip_r = Rect::from_center_size(pos2(tip_x, track.top() - 12.0), vec2(36.0, 16.0));
+                    p.rect_filled(
+                        tip_r,
+                        CornerRadius::same(5),
+                        Color32::from_rgba_unmultiplied(10, 12, 18, 225),
+                    );
+                    p.text(
+                        tip_r.center(),
+                        Align2::CENTER_CENTER,
+                        tip,
+                        semibold(9.5),
+                        TEXT,
                     );
                 }
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(ellipsize(&meta, n_meta))
-                            .size(10.5)
-                            .color(DIM),
-                    )
-                    .wrap_mode(egui::TextWrapMode::Extend),
-                );
-            });
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if icon_button(ui, Icon::Next, 28.0, false).clicked() {
-                    let _ = self.tx.send(media::Cmd::Next);
-                }
-                let icon = if media.playing {
-                    Icon::Pause
-                } else {
-                    Icon::Play
-                };
-                if icon_button(ui, icon, 34.0, true).clicked() {
-                    let _ = self.tx.send(media::Cmd::PlayPause);
-                }
-                if icon_button(ui, Icon::Prev, 28.0, false).clicked() {
-                    let _ = self.tx.send(media::Cmd::Prev);
-                }
-            });
-        });
-
-        // ---- progress ----
-        ui.add_space(5.0);
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 8.0;
-            ui.label(small(media::fmt_time(pos_ms)));
-            let bar_w = (ui.available_width() - 40.0).max(40.0);
-            let frac = if media.dur_ms > 0 {
-                pos_ms as f32 / media.dur_ms as f32
-            } else {
-                0.0
-            };
-            let resp = bar(ui, bar_w, frac, TEXT);
-            if resp.clicked() && media.dur_ms > 0 {
-                if let Some(p) = resp.interact_pointer_pos() {
-                    let f = ((p.x - resp.rect.left()) / resp.rect.width()).clamp(0.0, 1.0);
-                    let _ = self
-                        .tx
-                        .send(media::Cmd::Seek((f * media.dur_ms as f32) as u64));
-                }
             }
-            ui.label(small(media::fmt_time(media.dur_ms)));
-        });
+        }
+        if (scrub_resp.clicked() || scrub_resp.drag_stopped()) && media.dur_ms > 0 {
+            if let Some(pt) = scrub_resp.interact_pointer_pos() {
+                let f = ((pt.x - track.left()) / track.width()).clamp(0.0, 1.0);
+                let _ = self
+                    .tx
+                    .send(media::Cmd::Seek((f * media.dur_ms as f32) as u64));
+            }
+        }
 
-        // ---- lirik (area dipadatkan sedikit supaya muat dengan baris album) ----
-        ui.add_space(4.0);
-        let (area, _) = ui.allocate_exact_size(vec2(ui.available_width(), 46.0), Sense::hover());
+        // Elapsed & total time
+        p.text(
+            pos2(track.left(), hero.bottom() - 11.5),
+            Align2::LEFT_CENTER,
+            media::fmt_time(pos_ms),
+            FontId::proportional(10.0),
+            Color32::from_rgba_unmultiplied(200, 208, 226, 185),
+        );
+        p.text(
+            pos2(track.right(), hero.bottom() - 11.5),
+            Align2::RIGHT_CENTER,
+            media::fmt_time(media.dur_ms),
+            FontId::proportional(10.0),
+            Color32::from_rgba_unmultiplied(166, 174, 194, 175),
+        );
+
+        // ================= 2. LYRICS / AMBIENT STAGE =================
+        ui.add_space(8.0);
+        let (area, _) = ui.allocate_exact_size(vec2(w, 54.0), Sense::hover());
+        let p = ui.painter().clone();
+        p.rect_filled(area, CornerRadius::same(12), Color32::from_rgb(10, 12, 18));
+        p.rect_stroke(
+            area,
+            CornerRadius::same(12),
+            Stroke::new(1.0, Color32::from_rgb(28, 32, 44)),
+            StrokeKind::Inside,
+        );
         let lead = self.lead_for(media);
-        Self::draw_lyrics(ui, area, lyrics, media::shift(pos_ms, lead));
-        self.offset_control(ui, area, media);
+        Self::draw_lyrics(
+            ui,
+            area.shrink2(vec2(10.0, 4.0)),
+            lyrics,
+            media::shift(pos_ms, lead),
+            media.playing,
+            accent,
+        );
+        self.offset_control(ui, area.shrink2(vec2(8.0, 4.0)), media);
     }
 
-    fn draw_lyrics(ui: &Ui, area: Rect, lyrics: &Lyrics, pos_ms: u64) {
+    fn draw_lyrics(
+        ui: &Ui,
+        area: Rect,
+        lyrics: &Lyrics,
+        pos_ms: u64,
+        playing: bool,
+        accent: Color32,
+    ) {
         let painter = ui.painter_at(area);
         let center = area.center();
         match lyrics {
@@ -773,8 +1329,12 @@ impl EmelkaNotch {
                     painter.text(
                         pos2(center.x, center.y + dy),
                         Align2::CENTER_CENTER,
-                        ellipsize(&lines[i as usize].1, 62),
-                        FontId::proportional(13.0),
+                        ellipsize(&lines[i as usize].1, 60),
+                        if focus > 0.6 {
+                            semibold(13.0)
+                        } else {
+                            FontId::proportional(12.0)
+                        },
                         color,
                     );
                 }
@@ -783,120 +1343,485 @@ impl EmelkaNotch {
                 painter.text(
                     center,
                     Align2::CENTER_CENTER,
-                    "Looking for lyrics…",
-                    FontId::proportional(12.0),
+                    "Looking for synced lyrics…",
+                    FontId::proportional(11.5),
                     MUTED,
                 );
             }
             Lyrics::NotFound | Lyrics::Idle => {
+                // Subtle ambient waveform bars + quiet label so the stage feels alive
+                let time = ui.input(|i| i.time) as f32;
+                let bars = 17usize;
+                let gap = 5.5;
+                let total_w = (bars as f32 - 1.0) * gap;
+                let x0 = center.x - total_w * 0.5;
+                let wy = center.y - 7.0;
+                for i in 0..bars {
+                    let norm = (i as f32 / (bars - 1) as f32 - 0.5).abs() * 2.0; // 0 at center, 1 at edge
+                    let env = (1.0 - norm * norm).max(0.2);
+                    let h = if playing {
+                        3.0 + 13.0
+                            * env
+                            * ((time * 5.2 + i as f32 * 0.85).sin() * 0.35
+                                + (time * 3.1 - i as f32 * 1.3).cos() * 0.25
+                                + 0.5)
+                    } else {
+                        3.0
+                    };
+                    let bar_r = Rect::from_center_size(pos2(x0 + i as f32 * gap, wy), vec2(2.2, h));
+                    painter.rect_filled(
+                        bar_r,
+                        CornerRadius::same(1),
+                        accent.gamma_multiply(if playing { 0.38 + 0.38 * env } else { 0.22 }),
+                    );
+                }
                 painter.text(
-                    center,
+                    pos2(center.x, center.y + 12.0),
                     Align2::CENTER_CENTER,
-                    "No synced lyrics found",
-                    FontId::proportional(12.0),
+                    "No synced lyrics available",
+                    FontId::proportional(10.0),
                     DIM,
                 );
             }
         }
     }
 
+    fn paint_sys_card(p: &egui::Painter, rect: Rect, radius: f32, tint: Color32) {
+        use std::f32::consts::{FRAC_PI_2, PI};
+        let r = radius.min(rect.width() * 0.5).min(rect.height() * 0.5);
+        let segs = 7usize;
+        let corners = [
+            (pos2(rect.right() - r, rect.top() + r), -FRAC_PI_2, 0.0),
+            (pos2(rect.right() - r, rect.bottom() - r), 0.0, FRAC_PI_2),
+            (pos2(rect.left() + r, rect.bottom() - r), FRAC_PI_2, PI),
+            (pos2(rect.left() + r, rect.top() + r), PI, PI + FRAC_PI_2),
+        ];
+        let light = pos2(rect.right() - 28.0, rect.top() + 18.0);
+        let top_c = Color32::from_rgb(15, 18, 26);
+        let bot_c = Color32::from_rgb(10, 12, 18);
+        let sample = |pt: egui::Pos2| {
+            let ty = ((pt.y - rect.top()) / rect.height().max(1.0)).clamp(0.0, 1.0);
+            let base = top_c.lerp_to_gamma(bot_c, ty);
+            let dist = (pt - light).length() / 155.0;
+            let glow = (1.0 - dist).clamp(0.0, 1.0).powi(2) * 0.22;
+            base.lerp_to_gamma(tint, glow)
+        };
+        let mut perim = Vec::with_capacity(corners.len() * (segs + 1));
+        for (center, a0, a1) in corners {
+            for s in 0..=segs {
+                let a = a0 + (a1 - a0) * (s as f32 / segs as f32);
+                perim.push(pos2(center.x + r * a.cos(), center.y + r * a.sin()));
+            }
+        }
+        let mut mesh = egui::Mesh::default();
+        let c = rect.center();
+        mesh.colored_vertex(c, sample(c));
+        for &pt in &perim {
+            mesh.colored_vertex(pt, sample(pt));
+        }
+        let n = perim.len() as u32;
+        for i in 0..n {
+            let next = if i + 1 == n { 1 } else { i + 2 };
+            mesh.add_triangle(0, i + 1, next);
+        }
+        p.add(egui::Shape::mesh(mesh));
+    }
+
+    fn draw_sys_sparkline(
+        p: &egui::Painter,
+        r: Rect,
+        data: &std::collections::VecDeque<f32>,
+        color: Color32,
+        hover_x: Option<f32>,
+    ) -> Option<f32> {
+        // Subtle 50% baseline
+        let mid_y = r.center().y;
+        p.line_segment(
+            [pos2(r.left(), mid_y), pos2(r.right(), mid_y)],
+            Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 12)),
+        );
+        p.line_segment(
+            [pos2(r.left(), r.bottom()), pos2(r.right(), r.bottom())],
+            Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 16)),
+        );
+        if data.len() < 2 {
+            return None;
+        }
+        let n = data.len();
+        let step = r.width() / (HIST - 1) as f32;
+        let pts: Vec<egui::Pos2> = data
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                pos2(
+                    r.right() - (n - 1 - i) as f32 * step,
+                    r.bottom() - v.clamp(0.0, 1.0) * r.height(),
+                )
+            })
+            .collect();
+
+        let mut mesh = egui::Mesh::default();
+        for pt in &pts {
+            mesh.colored_vertex(*pt, color.gamma_multiply(0.28));
+            mesh.colored_vertex(pos2(pt.x, r.bottom()), Color32::TRANSPARENT);
+        }
+        for i in 0..pts.len() - 1 {
+            let k = (i * 2) as u32;
+            mesh.add_triangle(k, k + 1, k + 2);
+            mesh.add_triangle(k + 1, k + 2, k + 3);
+        }
+        p.add(egui::Shape::mesh(mesh));
+        p.add(egui::Shape::line(
+            pts.clone(),
+            Stroke::new(3.6, color.gamma_multiply(0.14)),
+        ));
+        p.add(egui::Shape::line(pts.clone(), Stroke::new(1.7, color)));
+
+        if let Some(last) = pts.last() {
+            p.circle_filled(*last, 2.6, color);
+            p.circle_filled(*last, 1.1, Color32::WHITE);
+        }
+
+        // Optional interactive hover readout
+        if let Some(hx) = hover_x {
+            if let Some((idx, best_pt)) = pts
+                .iter()
+                .enumerate()
+                .min_by(|(_, a), (_, b)| (a.x - hx).abs().total_cmp(&(b.x - hx).abs()))
+            {
+                if (best_pt.x - hx).abs() <= step.max(10.0) {
+                    p.line_segment(
+                        [pos2(best_pt.x, r.top()), pos2(best_pt.x, r.bottom())],
+                        Stroke::new(1.0, color.gamma_multiply(0.45)),
+                    );
+                    p.circle_filled(*best_pt, 3.2, Color32::WHITE);
+                    return data.get(idx).copied();
+                }
+            }
+        }
+        None
+    }
+
     pub(crate) fn system_section(&self, ui: &mut Ui) {
+        ui.spacing_mut().item_spacing.y = 0.0;
+        let w = ui.available_width();
         let gb = 1_073_741_824.0;
         let cpu = self.cpu_hist.back().copied().unwrap_or(0.0);
         let mem = self.mem_hist.back().copied().unwrap_or(0.0);
         let used = self.sys.used_memory() as f64 / gb;
         let total = self.sys.total_memory() as f64 / gb;
+        let free = (total - used).max(0.0);
+        let cores = self.sys.cpus().len();
+        let cpu_peak = self
+            .cpu_hist
+            .iter()
+            .copied()
+            .fold(cpu, f32::max);
 
-        let gap = 8.0;
-        let w = (ui.available_width() - gap * 2.0) / 3.0;
-        let h = ui.available_height().max(132.0);
-        let chart = |r: Rect| {
-            Rect::from_min_max(
-                pos2(r.left() + 12.0, r.top() + 34.0),
-                pos2(r.right() - 12.0, r.bottom() - 28.0),
-            )
+        let up_s = sysinfo::System::uptime();
+        let up_txt = {
+            let d = up_s / 86_400;
+            let h = (up_s % 86_400) / 3600;
+            let m = (up_s % 3600) / 60;
+            if d > 0 {
+                format!("Up {d}d {h}h")
+            } else if h > 0 {
+                format!("Up {h}h {m:02}m")
+            } else {
+                format!("Up {m}m")
+            }
         };
 
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = gap;
+        let cpu_col = if cpu > 0.85 {
+            WARN
+        } else if cpu > 0.65 {
+            Color32::from_rgb(248, 190, 92)
+        } else {
+            Color32::from_rgb(108, 182, 255)
+        };
+        let mem_col = if mem > 0.88 {
+            WARN
+        } else if mem > 0.78 {
+            Color32::from_rgb(245, 178, 98)
+        } else {
+            Color32::from_rgb(162, 138, 255)
+        };
 
-            // CPU
-            let (r, p) = card(ui, w, h);
-            card_header(&p, r, "CPU", &format!("{:.0}%", cpu * 100.0));
-            sparkline(&p, chart(r), &self.cpu_hist, ACCENT);
+        let ptr = ui.input(|i| i.pointer.hover_pos());
+
+        // ================= 1. TOP TELEMETRY PAIR: CPU + MEMORY =================
+        let gap = 8.0;
+        let cw = (w - gap) * 0.5;
+        let top_h = 118.0;
+        let (top_row, _) = ui.allocate_exact_size(vec2(w, top_h), Sense::hover());
+        let p = ui.painter().clone();
+
+        // ---- CPU CARD ----
+        let cpu_r = Rect::from_min_size(top_row.min, vec2(cw, top_h));
+        Self::paint_sys_card(&p, cpu_r, 14.0, cpu_col);
+        p.rect_stroke(
+            cpu_r,
+            CornerRadius::same(14),
+            Stroke::new(1.0, Color32::from_rgb(34, 40, 54)),
+            StrokeKind::Inside,
+        );
+
+        // Mini CPU chip glyph
+        let ic = pos2(cpu_r.left() + 18.0, cpu_r.top() + 20.0);
+        p.rect_stroke(
+            Rect::from_center_size(ic, vec2(8.0, 8.0)),
+            CornerRadius::same(2),
+            Stroke::new(1.2, cpu_col),
+            StrokeKind::Inside,
+        );
+        p.rect_filled(
+            Rect::from_center_size(ic, vec2(3.0, 3.0)),
+            CornerRadius::same(1),
+            cpu_col,
+        );
+        p.text(
+            pos2(cpu_r.left() + 28.0, cpu_r.top() + 17.0),
+            Align2::LEFT_CENTER,
+            "CPU",
+            semibold(12.0),
+            TEXT,
+        );
+        p.text(
+            pos2(cpu_r.left() + 28.0, cpu_r.top() + 30.0),
+            Align2::LEFT_CENTER,
+            format!("{cores} threads"),
+            FontId::proportional(9.5),
+            DIM,
+        );
+
+        let cpu_chart = Rect::from_min_max(
+            pos2(cpu_r.left() + 12.0, cpu_r.top() + 44.0),
+            pos2(cpu_r.right() - 12.0, cpu_r.bottom() - 25.0),
+        );
+        let cpu_hx = ptr.filter(|pos| cpu_chart.contains(*pos)).map(|pos| pos.x);
+        let cpu_hov = Self::draw_sys_sparkline(&p, cpu_chart, &self.cpu_hist, cpu_col, cpu_hx);
+        let cpu_shown = cpu_hov.unwrap_or(cpu);
+
+        p.text(
+            pos2(cpu_r.right() - 14.0, cpu_r.top() + 23.0),
+            Align2::RIGHT_CENTER,
+            format!("{:.0}%", cpu_shown * 100.0),
+            semibold(21.0),
+            if cpu_hov.is_some() { cpu_col } else { TEXT },
+        );
+        p.text(
+            pos2(cpu_r.left() + 13.0, cpu_r.bottom() - 12.5),
+            Align2::LEFT_CENTER,
+            format!("Peak {:.0}%", cpu_peak * 100.0),
+            FontId::proportional(10.0),
+            MUTED,
+        );
+        p.text(
+            pos2(cpu_r.right() - 13.0, cpu_r.bottom() - 12.5),
+            Align2::RIGHT_CENTER,
+            up_txt,
+            FontId::proportional(10.0),
+            DIM,
+        );
+
+        // ---- MEMORY CARD ----
+        let mem_r = Rect::from_min_size(pos2(cpu_r.right() + gap, top_row.top()), vec2(cw, top_h));
+        Self::paint_sys_card(&p, mem_r, 14.0, mem_col);
+        p.rect_stroke(
+            mem_r,
+            CornerRadius::same(14),
+            Stroke::new(1.0, Color32::from_rgb(34, 40, 54)),
+            StrokeKind::Inside,
+        );
+
+        // Mini RAM module glyph
+        let mc = pos2(mem_r.left() + 18.0, mem_r.top() + 20.0);
+        p.rect_stroke(
+            Rect::from_center_size(mc, vec2(10.0, 6.5)),
+            CornerRadius::same(1),
+            Stroke::new(1.2, mem_col),
+            StrokeKind::Inside,
+        );
+        for dx in [-2.5f32, 0.0, 2.5] {
+            p.line_segment(
+                [pos2(mc.x + dx, mc.y + 3.2), pos2(mc.x + dx, mc.y + 5.2)],
+                Stroke::new(1.1, mem_col),
+            );
+        }
+        p.text(
+            pos2(mem_r.left() + 28.0, mem_r.top() + 17.0),
+            Align2::LEFT_CENTER,
+            "Memory",
+            semibold(12.0),
+            TEXT,
+        );
+        p.text(
+            pos2(mem_r.left() + 28.0, mem_r.top() + 30.0),
+            Align2::LEFT_CENTER,
+            format!("{free:.1} GB free"),
+            FontId::proportional(9.5),
+            DIM,
+        );
+
+        // Utilization gauge bar + compact trend sparkline
+        let bar_r = Rect::from_min_max(
+            pos2(mem_r.left() + 13.0, mem_r.top() + 45.0),
+            pos2(mem_r.right() - 13.0, mem_r.top() + 51.0),
+        );
+        p.rect_filled(bar_r, CornerRadius::same(3), Color32::from_rgb(26, 30, 42));
+        let fill_w = (bar_r.width() * mem.clamp(0.0, 1.0)).max(3.0);
+        p.rect_filled(
+            Rect::from_min_size(bar_r.min, vec2(fill_w, bar_r.height())),
+            CornerRadius::same(3),
+            mem_col,
+        );
+
+        let mem_chart = Rect::from_min_max(
+            pos2(mem_r.left() + 12.0, mem_r.top() + 60.0),
+            pos2(mem_r.right() - 12.0, mem_r.bottom() - 25.0),
+        );
+        let mem_hx = ptr.filter(|pos| mem_chart.contains(*pos)).map(|pos| pos.x);
+        let mem_hov = Self::draw_sys_sparkline(&p, mem_chart, &self.mem_hist, mem_col, mem_hx);
+        let mem_shown = mem_hov.unwrap_or(mem);
+
+        p.text(
+            pos2(mem_r.right() - 14.0, mem_r.top() + 23.0),
+            Align2::RIGHT_CENTER,
+            format!("{:.0}%", mem_shown * 100.0),
+            semibold(21.0),
+            if mem_hov.is_some() { mem_col } else { TEXT },
+        );
+        p.text(
+            pos2(mem_r.left() + 13.0, mem_r.bottom() - 12.5),
+            Align2::LEFT_CENTER,
+            format!("{used:.1} / {total:.1} GB"),
+            FontId::proportional(10.0),
+            MUTED,
+        );
+        p.text(
+            pos2(mem_r.right() - 13.0, mem_r.bottom() - 12.5),
+            Align2::RIGHT_CENTER,
+            "60s trend",
+            FontId::proportional(10.0),
+            DIM,
+        );
+
+        // ================= 2. FULL-WIDTH STORAGE DECK =================
+        ui.add_space(8.0);
+        let st_h = 70.0;
+        let (st_r, _) = ui.allocate_exact_size(vec2(w, st_h), Sense::hover());
+        let p = ui.painter().clone();
+        p.rect_filled(st_r, CornerRadius::same(14), Color32::from_rgb(10, 12, 18));
+        p.rect_stroke(
+            st_r,
+            CornerRadius::same(14),
+            Stroke::new(1.0, Color32::from_rgb(28, 33, 45)),
+            StrokeKind::Inside,
+        );
+
+        // Drive glyph + header
+        let dc = pos2(st_r.left() + 17.0, st_r.top() + 16.0);
+        p.rect_stroke(
+            Rect::from_center_size(dc, vec2(10.0, 7.0)),
+            CornerRadius::same(2),
+            Stroke::new(1.2, MUTED),
+            StrokeKind::Inside,
+        );
+        p.circle_filled(pos2(dc.x + 2.5, dc.y), 1.0, GREEN);
+        p.text(
+            pos2(st_r.left() + 27.0, st_r.top() + 16.0),
+            Align2::LEFT_CENTER,
+            "Storage",
+            semibold(11.5),
+            TEXT,
+        );
+
+        if self.disks.is_empty() {
             p.text(
-                pos2(r.left() + 12.0, r.bottom() - 14.0),
-                Align2::LEFT_CENTER,
-                "Last 60s",
-                FontId::proportional(10.0),
+                pos2(st_r.center().x, st_r.bottom() - 22.0),
+                Align2::CENTER_CENTER,
+                "No disk information available",
+                FontId::proportional(11.0),
                 DIM,
             );
+            return;
+        }
 
-            // RAM
-            let (r, p) = card(ui, w, h);
-            card_header(&p, r, "RAM", &format!("{:.0}%", mem * 100.0));
-            sparkline(&p, chart(r), &self.mem_hist, PURPLE);
+        let tot_used: f64 = self.disks.iter().map(|d| d.used_gb).sum();
+        let tot_cap: f64 = self.disks.iter().map(|d| d.total_gb).sum();
+        let n = self.disks.len();
+        p.text(
+            pos2(st_r.right() - 14.0, st_r.top() + 16.0),
+            Align2::RIGHT_CENTER,
+            format!(
+                "{n} drive{} · {} / {}",
+                if n == 1 { "" } else { "s" },
+                fmt_gb(tot_used),
+                fmt_gb(tot_cap)
+            ),
+            FontId::proportional(10.0),
+            MUTED,
+        );
+
+        let shown = n.min(3);
+        let pad_x = 14.0;
+        let inner_w = st_r.width() - pad_x * 2.0;
+        let seg_gap = 16.0;
+        let seg_w = (inner_w - seg_gap * (shown as f32 - 1.0)) / shown as f32;
+        for (i, d) in self.disks.iter().take(shown).enumerate() {
+            let x0 = st_r.left() + pad_x + i as f32 * (seg_w + seg_gap);
+            let x1 = x0 + seg_w;
+            if i > 0 {
+                let dx = x0 - seg_gap * 0.5;
+                p.line_segment(
+                    [pos2(dx, st_r.top() + 31.0), pos2(dx, st_r.bottom() - 11.0)],
+                    Stroke::new(1.0, Color32::from_rgb(28, 32, 44)),
+                );
+            }
+            let frac = (d.used_gb / d.total_gb.max(0.001)).clamp(0.0, 1.0) as f32;
+            let free_gb = (d.total_gb - d.used_gb).max(0.0);
+            let col = if frac > 0.88 {
+                WARN
+            } else if frac > 0.75 {
+                Color32::from_rgb(245, 186, 92)
+            } else {
+                GREEN
+            };
+
+            // Drive badge + capacity
+            let badge_r = Rect::from_min_size(pos2(x0, st_r.top() + 30.0), vec2(24.0, 16.0));
+            p.rect_filled(badge_r, CornerRadius::same(4), Color32::from_rgb(22, 26, 37));
             p.text(
-                pos2(r.left() + 12.0, r.bottom() - 14.0),
+                badge_r.center(),
+                Align2::CENTER_CENTER,
+                &d.name,
+                semibold(10.0),
+                TEXT,
+            );
+            p.text(
+                pos2(badge_r.right() + 7.0, badge_r.center().y),
                 Align2::LEFT_CENTER,
-                format!("{used:.1} / {total:.1} GB"),
+                format!("{} / {}", fmt_gb(d.used_gb), fmt_gb(d.total_gb)),
                 FontId::proportional(10.0),
                 MUTED,
             );
+            p.text(
+                pos2(x1, badge_r.center().y),
+                Align2::RIGHT_CENTER,
+                format!("{} free", fmt_gb(free_gb)),
+                semibold(10.0),
+                if frac > 0.88 { WARN } else { col },
+            );
 
-            // Storage (all drives)
-            let (r, p) = card(ui, w, h);
-            if self.disks.is_empty() {
-                card_header(&p, r, "Storage", "");
-                p.text(
-                    r.center(),
-                    Align2::CENTER_CENTER,
-                    "No disk info",
-                    FontId::proportional(11.0),
-                    DIM,
-                );
-            } else {
-                let n = self.disks.len();
-                card_header(
-                    &p,
-                    r,
-                    "Storage",
-                    &format!("{n} drive{}", if n == 1 { "" } else { "s" }),
-                );
-                let shown = n.min(4);
-                let row_h = (88.0_f32 / shown as f32).min(30.0);
-                let (x0, x1) = (r.left() + 12.0, r.right() - 12.0);
-                for (i, d) in self.disks.iter().take(shown).enumerate() {
-                    let top = r.top() + 36.0 + i as f32 * row_h;
-                    let frac = (d.used_gb / d.total_gb.max(0.001)) as f32;
-                    let col = if frac > 0.9 { WARN } else { GREEN };
-                    p.text(
-                        pos2(x0, top + 6.0),
-                        Align2::LEFT_CENTER,
-                        &d.name,
-                        semibold(11.0),
-                        TEXT,
-                    );
-                    p.text(
-                        pos2(x1, top + 6.0),
-                        Align2::RIGHT_CENTER,
-                        format!("{} / {}", fmt_gb(d.used_gb), fmt_gb(d.total_gb)),
-                        FontId::proportional(10.0),
-                        MUTED,
-                    );
-                    let track = Rect::from_min_size(pos2(x0, top + 15.0), vec2(x1 - x0, 4.0));
-                    p.rect_filled(track, CornerRadius::same(2), TRACK);
-                    p.rect_filled(
-                        Rect::from_min_size(
-                            track.min,
-                            vec2(track.width() * frac.clamp(0.0, 1.0), 4.0),
-                        ),
-                        CornerRadius::same(2),
-                        col,
-                    );
-                }
-            }
-        });
+            // Drive bar
+            let track = Rect::from_min_size(pos2(x0, st_r.bottom() - 15.0), vec2(seg_w, 5.0));
+            p.rect_filled(track, CornerRadius::same(3), Color32::from_rgb(24, 28, 39));
+            p.rect_filled(
+                Rect::from_min_size(track.min, vec2((track.width() * frac).max(3.0), 5.0)),
+                CornerRadius::same(3),
+                col,
+            );
+        }
     }
 
     fn add_todo(&mut self) -> bool {
@@ -1045,74 +1970,16 @@ impl EmelkaNotch {
             }
         };
 
-        // =============== HERO ===============
+        // =============== HEADER: LOCATION + DATE ===============
         ui.spacing_mut().item_spacing.y = 0.0;
         let w = ui.available_width();
         let col = prayer_color(next_i);
-        let hero_h = 66.0;
-        let (hero, _) = ui.allocate_exact_size(vec2(w, hero_h), Sense::hover());
+        let surface = Color32::from_rgb(12, 13, 18);
+        let surface_dim = Color32::from_rgb(7, 8, 11);
+        let border_soft = Color32::from_rgb(34, 37, 47);
+
+        let (hdr, _) = ui.allocate_exact_size(vec2(w, 18.0), Sense::hover());
         let p = ui.painter().clone();
-        let hero_bg = CARD.lerp_to_gamma(col, 0.10);
-        p.rect_filled(hero, CornerRadius::same(12), hero_bg);
-        p.rect_stroke(
-            hero,
-            CornerRadius::same(12),
-            Stroke::new(1.0, col.gamma_multiply(0.45)),
-            StrokeKind::Inside,
-        );
-
-        // icon + countdown
-        let ic = pos2(hero.left() + 30.0, hero.top() + 29.0);
-        let ic_bg = hero_bg.lerp_to_gamma(col, 0.22);
-        p.circle_filled(ic, 18.0, ic_bg);
-        prayer_icon(&p, ic, next_i, col, ic_bg);
-        p.text(
-            pos2(hero.left() + 58.0, hero.top() + 19.0),
-            Align2::LEFT_CENTER,
-            format!(
-                "Until {}{}",
-                PRAYER_NAMES[next_i],
-                if tomorrow { " (tomorrow)" } else { "" }
-            ),
-            FontId::proportional(10.5),
-            MUTED,
-        );
-        p.text(
-            pos2(hero.left() + 58.0, hero.top() + 38.5),
-            Align2::LEFT_CENTER,
-            cd,
-            semibold(20.0),
-            TEXT,
-        );
-
-        // Imsak / Sunrise / Dhuha
-        let x0 = hero.left() + 170.0;
-        for (j, idx) in [0usize, 2, 3].into_iter().enumerate() {
-            let cx = x0 + j as f32 * 58.0 + 29.0;
-            p.text(
-                pos2(cx, hero.top() + 20.5),
-                Align2::CENTER_CENTER,
-                PRAYER_NAMES[idx],
-                FontId::proportional(10.0),
-                prayer_color(idx),
-            );
-            p.text(
-                pos2(cx, hero.top() + 38.0),
-                Align2::CENTER_CENTER,
-                fmt_hm(day.t[idx]),
-                semibold(12.0),
-                TEXT,
-            );
-        }
-
-        // next prayer time + location (click = re-detect)
-        p.text(
-            pos2(hero.right() - 14.0, hero.top() + 20.5),
-            Align2::RIGHT_CENTER,
-            fmt_hm(shown(next_i)),
-            semibold(17.0),
-            col,
-        );
         let is_updating = matches!(
             status,
             crate::prayer::PrayerStatus::Locating | crate::prayer::PrayerStatus::Loading
@@ -1120,13 +1987,13 @@ impl EmelkaNotch {
         let loc_txt = if is_updating {
             "Locating…".to_string()
         } else {
-            ellipsize(kab.trim_start_matches("Kota "), 18)
+            ellipsize(kab.trim_start_matches("Kota "), 26)
         };
-        let lf = FontId::proportional(10.5);
+        let lf = FontId::proportional(11.0);
         let lw = text_w(&p, &loc_txt, &lf);
         let loc_rect = Rect::from_min_max(
-            pos2(hero.right() - lw - 36.0, hero.top() + 30.0),
-            pos2(hero.right() - 6.0, hero.top() + 48.0),
+            pos2(hdr.left(), hdr.top() - 2.0),
+            pos2(hdr.left() + 18.0 + lw + 6.0, hdr.bottom() + 2.0),
         );
         let lr =
             btn_rect(ui, loc_rect, "pr_loc").on_hover_text("Click to re-detect location & refresh");
@@ -1137,16 +2004,23 @@ impl EmelkaNotch {
         } else {
             MUTED
         };
+        let pin = pos2(hdr.left() + 6.0, hdr.center().y);
+        p.circle_stroke(pin, 2.8, Stroke::new(1.2, lcol));
+        p.circle_filled(pin, 1.0, lcol);
         p.text(
-            pos2(hero.right() - 14.0, hero.top() + 39.5),
-            Align2::RIGHT_CENTER,
+            pos2(hdr.left() + 15.0, hdr.center().y),
+            Align2::LEFT_CENTER,
             &loc_txt,
             lf,
             lcol,
         );
-        let pin = pos2(hero.right() - 14.0 - lw - 9.0, hero.top() + 39.5);
-        p.circle_stroke(pin, 2.6, Stroke::new(1.1, lcol));
-        p.circle_filled(pin, 0.9, lcol);
+        p.text(
+            pos2(hdr.right(), hdr.center().y),
+            Align2::RIGHT_CENTER,
+            now.format("%a, %d %b").to_string(),
+            FontId::proportional(10.5),
+            MUTED,
+        );
         if lr.clicked() {
             {
                 let mut s = self.prayer.lock().unwrap();
@@ -1160,92 +2034,201 @@ impl EmelkaNotch {
             }
         }
 
-        // progress bar between prayers
-        let track = Rect::from_min_max(
-            pos2(hero.left() + 14.0, hero.bottom() - 9.5),
-            pos2(hero.right() - 14.0, hero.bottom() - 7.0),
-        );
-        p.rect_filled(track, CornerRadius::same(1), TRACK);
-        p.rect_filled(
-            Rect::from_min_size(track.min, vec2(track.width() * frac, track.height())),
-            CornerRadius::same(1),
-            col,
+        // =============== HERO: NEXT PRAYER FOCUS ===============
+        ui.add_space(8.0);
+        let hero_h = 78.0;
+        let (hero, _) = ui.allocate_exact_size(vec2(w, hero_h), Sense::hover());
+        let p = ui.painter().clone();
+        p.rect_filled(hero, CornerRadius::same(14), surface);
+        p.rect_stroke(
+            hero,
+            CornerRadius::same(14),
+            Stroke::new(1.0, col.gamma_multiply(0.38)),
+            StrokeKind::Inside,
         );
 
-        // =============== 5 CARDS ===============
-        ui.add_space(10.0);
+        let ic = pos2(hero.left() + 28.0, hero.top() + 34.0);
+        let ic_bg = surface.lerp_to_gamma(col, 0.16);
+        p.circle_filled(ic, 17.0, ic_bg);
+        prayer_icon(&p, ic, next_i, col, ic_bg);
+
+        p.text(
+            pos2(hero.left() + 56.0, hero.top() + 20.0),
+            Align2::LEFT_CENTER,
+            format!(
+                "Next · {}{}",
+                PRAYER_NAMES[next_i],
+                if tomorrow { " (tomorrow)" } else { "" }
+            ),
+            FontId::proportional(11.0),
+            MUTED,
+        );
+        p.text(
+            pos2(hero.left() + 56.0, hero.top() + 43.0),
+            Align2::LEFT_CENTER,
+            cd,
+            semibold(24.0),
+            TEXT,
+        );
+
+        p.text(
+            pos2(hero.right() - 16.0, hero.top() + 26.0),
+            Align2::RIGHT_CENTER,
+            fmt_hm(shown(next_i)),
+            semibold(21.0),
+            col,
+        );
+        let cur_label = match cur {
+            Some(c_idx) => format!("Current · {}", PRAYER_NAMES[c_idx]),
+            None => "After Isha".to_string(),
+        };
+        p.text(
+            pos2(hero.right() - 16.0, hero.top() + 46.5),
+            Align2::RIGHT_CENTER,
+            cur_label,
+            FontId::proportional(10.5),
+            MUTED,
+        );
+
+        let track = Rect::from_min_max(
+            pos2(hero.left() + 16.0, hero.bottom() - 11.0),
+            pos2(hero.right() - 16.0, hero.bottom() - 8.0),
+        );
+        p.rect_filled(track, CornerRadius::same(2), TRACK);
+        let filled_w = (track.width() * frac).max(3.0);
+        p.rect_filled(
+            Rect::from_min_size(track.min, vec2(filled_w, track.height())),
+            CornerRadius::same(2),
+            col,
+        );
+        p.circle_filled(
+            pos2(track.left() + filled_w, track.center().y),
+            2.6,
+            TEXT,
+        );
+
+        // =============== 5 WAJIB PRAYERS ===============
+        ui.add_space(8.0);
         let gap = 6.0;
         let cw = (w - gap * 4.0) / 5.0;
-        let ch = ui.available_height().max(72.0);
+        let ch = 62.0;
         let (row, _) = ui.allocate_exact_size(vec2(w, ch), Sense::hover());
         for (n, &i) in MAIN_PRAYERS.iter().enumerate() {
             let r = Rect::from_min_size(
                 pos2(row.left() + n as f32 * (cw + gap), row.top()),
                 vec2(cw, ch),
             );
-            let c = prayer_color(i);
             let is_next = i == next_i;
             let is_cur = cur == Some(i);
             let passed = !is_next && !is_cur && times[i] <= secs;
 
             let bgc = if is_next {
-                CARD.lerp_to_gamma(c, 0.16)
+                surface.lerp_to_gamma(col, 0.14)
+            } else if is_cur {
+                Color32::from_rgb(18, 20, 28)
+            } else if passed {
+                surface_dim
             } else {
-                CARD
+                surface
             };
-            p.rect_filled(r, CornerRadius::same(12), bgc);
+            let stroke_col = if is_next {
+                col.gamma_multiply(0.85)
+            } else if is_cur {
+                Color32::from_rgb(62, 66, 82)
+            } else if passed {
+                Color32::from_rgb(26, 28, 36)
+            } else {
+                border_soft
+            };
+            p.rect_filled(r, CornerRadius::same(11), bgc);
             p.rect_stroke(
                 r,
-                CornerRadius::same(12),
-                Stroke::new(
-                    if is_next { 1.5 } else { 1.0 },
-                    if is_next {
-                        c
-                    } else if is_cur {
-                        c.gamma_multiply(0.5)
-                    } else {
-                        BORDER
-                    },
-                ),
+                CornerRadius::same(11),
+                Stroke::new(if is_next { 1.3 } else { 1.0 }, stroke_col),
                 StrokeKind::Inside,
             );
-            prayer_icon(
-                &p,
-                pos2(r.center().x, r.top() + r.height() * 0.28),
-                i,
-                if passed { DIM } else { c },
-                bgc,
-            );
+            let ic_col = if is_next {
+                col
+            } else if is_cur {
+                TEXT
+            } else if passed {
+                DIM
+            } else {
+                MUTED
+            };
+            prayer_icon(&p, pos2(r.center().x, r.top() + 16.0), i, ic_col, bgc);
             p.text(
-                pos2(r.center().x, r.top() + r.height() * 0.54),
+                pos2(r.center().x, r.top() + 34.0),
                 Align2::CENTER_CENTER,
                 PRAYER_NAMES[i],
-                FontId::proportional(10.5),
+                FontId::proportional(10.0),
                 if passed {
                     DIM
-                } else if is_next {
+                } else if is_next || is_cur {
                     TEXT
                 } else {
                     MUTED
                 },
             );
             p.text(
-                pos2(r.center().x, r.top() + r.height() * 0.77),
+                pos2(r.center().x, r.top() + 49.0),
                 Align2::CENTER_CENTER,
                 fmt_hm(shown(i)),
-                semibold(13.0),
+                semibold(12.5),
                 if passed {
                     DIM
                 } else if is_next {
-                    c
+                    col
                 } else {
                     TEXT
                 },
             );
             if is_cur {
-                // small dot = currently active prayer time
-                p.circle_filled(pos2(r.right() - 10.0, r.top() + 10.0), 2.5, c);
+                p.circle_filled(pos2(r.right() - 8.5, r.top() + 8.5), 2.3, col);
             }
+        }
+
+        // =============== SECONDARY TIMES: IMSAK · SUNRISE · DHUHA ===============
+        ui.add_space(8.0);
+        let (bar, _) = ui.allocate_exact_size(vec2(w, 24.0), Sense::hover());
+        p.rect_filled(bar, CornerRadius::same(8), surface_dim);
+        p.rect_stroke(
+            bar,
+            CornerRadius::same(8),
+            Stroke::new(1.0, Color32::from_rgb(28, 31, 40)),
+            StrokeKind::Inside,
+        );
+        let seg_w = w / 3.0;
+        for (j, idx) in [0usize, 2, 3].into_iter().enumerate() {
+            let x_l = bar.left() + j as f32 * seg_w;
+            if j > 0 {
+                p.line_segment(
+                    [pos2(x_l, bar.top() + 5.0), pos2(x_l, bar.bottom() - 5.0)],
+                    Stroke::new(1.0, Color32::from_rgb(30, 33, 42)),
+                );
+            }
+            let cx = x_l + seg_w * 0.5;
+            let name = PRAYER_NAMES[idx];
+            let time_s = fmt_hm(day.t[idx]);
+            let nf = FontId::proportional(10.5);
+            let tf = semibold(11.0);
+            let nw = text_w(&p, name, &nf);
+            let tw = text_w(&p, &time_s, &tf);
+            let start_x = cx - (nw + 6.0 + tw) * 0.5;
+            p.text(
+                pos2(start_x, bar.center().y),
+                Align2::LEFT_CENTER,
+                name,
+                nf,
+                MUTED,
+            );
+            p.text(
+                pos2(start_x + nw + 6.0, bar.center().y),
+                Align2::LEFT_CENTER,
+                time_s,
+                tf,
+                TEXT,
+            );
         }
     }
 

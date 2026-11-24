@@ -362,24 +362,149 @@ pub(crate) fn strip_brackets(s: &str) -> String {
 }
 
 pub(crate) fn clean_artist(s: &str) -> String {
-    let s = s.trim().trim_end_matches(" - Topic");
-    s.split(',').next().unwrap_or(s).trim().to_string()
+    let mut s = s.trim();
+    for suffix in [" - Topic", " Official", " VEVO", "VEVO"] {
+        if let Some(stripped) = s.strip_suffix(suffix) {
+            s = stripped.trim();
+        }
+    }
+    let lower = s.to_lowercase();
+    let mut cut = s.len();
+    for sep in [
+        ",", " & ", " and ", " dan ", " feat. ", " feat ", " ft. ", " ft ", " x ", " × ",
+        " with ", "/", "·",
+    ] {
+        if let Some(idx) = lower.find(sep) {
+            cut = cut.min(idx);
+        }
+    }
+    s[..cut].trim().to_string()
+}
+
+fn artist_parts(s: &str) -> Vec<String> {
+    let mut cleaned = s.trim().to_string();
+    for suffix in [" - Topic", " Official", " VEVO", "VEVO"] {
+        if let Some(stripped) = cleaned.strip_suffix(suffix) {
+            cleaned = stripped.trim().to_string();
+        }
+    }
+    let mut parts = Vec::new();
+    let mut push = |p: &str| {
+        let p = p.trim();
+        if !p.is_empty() && !parts.iter().any(|x: &String| x.eq_ignore_ascii_case(p)) {
+            parts.push(p.to_string());
+        }
+    };
+    let primary = clean_artist(&cleaned);
+    push(&primary);
+    push(&cleaned);
+
+    // Also collect secondary collab artists (e.g. "Lyodra dan Bilal Indrajaya" -> "Bilal Indrajaya")
+    let normalized = cleaned
+        .replace(" dan ", ",")
+        .replace(" DAN ", ",")
+        .replace(" and ", ",")
+        .replace(" AND ", ",")
+        .replace(" & ", ",")
+        .replace(" feat. ", ",")
+        .replace(" feat ", ",")
+        .replace(" ft. ", ",")
+        .replace(" ft ", ",")
+        .replace(" x ", ",")
+        .replace(" × ", ",")
+        .replace(" with ", ",")
+        .replace('/', ",")
+        .replace('·', ",");
+    for seg in normalized.split(',') {
+        push(seg);
+    }
+    parts
+}
+
+fn norm_text(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn artist_matches(candidate: &str, expected: &[String]) -> bool {
+    if expected.is_empty() {
+        return true;
+    }
+    let cn = norm_text(candidate);
+    if cn.is_empty() {
+        return false;
+    }
+    let c_words: Vec<&str> = cn.split_whitespace().collect();
+    for exp in expected {
+        let en = norm_text(exp);
+        if en.is_empty() {
+            continue;
+        }
+        if cn == en || cn.contains(&en) || en.contains(&cn) {
+            return true;
+        }
+        let e_words: Vec<&str> = en.split_whitespace().collect();
+        let shared = e_words
+            .iter()
+            .filter(|w| w.len() >= 3 && c_words.contains(w))
+            .count();
+        if shared > 0 && shared * 2 >= e_words.len().min(c_words.len()) {
+            return true;
+        }
+    }
+    false
+}
+
+fn title_matches(candidate: &str, expected: &str) -> bool {
+    let cn = norm_text(&strip_brackets(&clean_title(candidate)));
+    let en = norm_text(&strip_brackets(&clean_title(expected)));
+    if en.is_empty() {
+        return true;
+    }
+    if cn.is_empty() {
+        return false;
+    }
+    if cn == en || cn.contains(&en) || en.contains(&cn) {
+        return true;
+    }
+    let c_words: Vec<&str> = cn.split_whitespace().collect();
+    let e_words: Vec<&str> = en.split_whitespace().collect();
+    let shared = e_words.iter().filter(|w| c_words.contains(w)).count();
+    shared > 0 && shared * 2 >= e_words.len()
 }
 
 fn candidates(artist: &str, title: &str) -> Vec<(String, String)> {
-    let a = clean_artist(artist);
+    let artists = artist_parts(artist);
     let t1 = clean_title(title);
     let t2 = strip_brackets(&t1);
     let mut v: Vec<(String, String)> = Vec::new();
     let mut push = |a: String, t: String| {
-        if !t.is_empty() && !v.iter().any(|(x, y)| *x == a && *y == t) {
+        if !t.is_empty() && !v.iter().any(|(x, y)| x.eq_ignore_ascii_case(&a) && y.eq_ignore_ascii_case(&t)) {
             v.push((a, t));
         }
     };
-    push(a.clone(), t1.clone());
-    push(a.clone(), t2.clone());
+    for a in &artists {
+        push(a.clone(), t1.clone());
+        push(a.clone(), t2.clone());
+    }
+    if artists.is_empty() {
+        push(String::new(), t1.clone());
+        push(String::new(), t2.clone());
+    }
     if let Some((l, r)) = t2.split_once(" - ") {
-        push(l.trim().to_string(), r.trim().to_string());
+        for a in artist_parts(l) {
+            push(a, r.trim().to_string());
+        }
     }
     v
 }
@@ -446,7 +571,12 @@ fn call(path: &str, params: &[(&str, &str)], transient: &mut bool) -> Option<ser
     }
 }
 
-fn best_synced(items: &[serde_json::Value], dur_s: u64) -> Option<Lyrics> {
+fn best_synced(
+    items: &[serde_json::Value],
+    expected_artists: &[String],
+    expected_title: &str,
+    dur_s: u64,
+) -> Option<Lyrics> {
     let mut best: Option<(f64, &serde_json::Value)> = None;
     for v in items {
         let has = v
@@ -454,6 +584,14 @@ fn best_synced(items: &[serde_json::Value], dur_s: u64) -> Option<Lyrics> {
             .and_then(|s| s.as_str())
             .map_or(false, |s| !s.trim().is_empty());
         if !has {
+            continue;
+        }
+        let item_artist = v.get("artistName").and_then(|s| s.as_str()).unwrap_or("");
+        if !artist_matches(item_artist, expected_artists) {
+            continue;
+        }
+        let item_title = v.get("trackName").and_then(|s| s.as_str()).unwrap_or("");
+        if !title_matches(item_title, expected_title) {
             continue;
         }
         let d = v.get("duration").and_then(|d| d.as_f64()).unwrap_or(0.0);
@@ -474,9 +612,20 @@ fn fetch_once(artist: &str, title: &str, dur_s: u64) -> (Option<Lyrics>, bool) {
     let mut tr = false;
     let dur_str = dur_s.to_string();
     let cands = candidates(artist, title);
+    let mut expected_artists = artist_parts(artist);
+    if let Some((l, _)) = strip_brackets(&clean_title(title)).split_once(" - ") {
+        for a in artist_parts(l) {
+            if !expected_artists.iter().any(|x| x.eq_ignore_ascii_case(&a)) {
+                expected_artists.push(a);
+            }
+        }
+    }
 
     for (a, t) in &cands {
         let (a, t) = (a.as_str(), t.as_str());
+        if a.is_empty() {
+            continue;
+        }
 
         if dur_s > 0 {
             if let Some(v) = call(
@@ -501,7 +650,7 @@ fn fetch_once(artist: &str, title: &str, dur_s: u64) -> (Option<Lyrics>, bool) {
         if let Some(serde_json::Value::Array(items)) =
             call("search", &[("artist_name", a), ("track_name", t)], &mut tr)
         {
-            if let Some(l) = best_synced(&items, dur_s) {
+            if let Some(l) = best_synced(&items, &expected_artists, t, dur_s) {
                 return (Some(l), false);
             }
         }
@@ -510,14 +659,14 @@ fn fetch_once(artist: &str, title: &str, dur_s: u64) -> (Option<Lyrics>, bool) {
     if let Some((a, t)) = cands.first() {
         let q = format!("{a} {t}");
         if let Some(serde_json::Value::Array(items)) = call("search", &[("q", &q)], &mut tr) {
-            if let Some(l) = best_synced(&items, dur_s) {
+            if let Some(l) = best_synced(&items, &expected_artists, t, dur_s) {
                 return (Some(l), false);
             }
         }
         if let Some(serde_json::Value::Array(items)) =
             call("search", &[("track_name", t.as_str())], &mut tr)
         {
-            if let Some(l) = best_synced(&items, dur_s) {
+            if let Some(l) = best_synced(&items, &expected_artists, t, dur_s) {
                 return (Some(l), false);
             }
         }

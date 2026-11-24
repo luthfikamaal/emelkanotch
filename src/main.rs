@@ -67,6 +67,10 @@ struct EmelkaNotch {
     style: NotchStyle,
     style_t: f32, // 0 = Floating, 1 = Attached (animated)
     osd_enabled: bool,
+    auto_hide: bool,
+    reveal_height: f32,
+    reveal_t: f32, // 0 = hidden above top edge, 1 = visible
+    autostart: bool,
     osd: Arc<Mutex<OsdState>>,
 
     // animation / hover
@@ -87,6 +91,7 @@ struct EmelkaNotch {
 
     // app icon textures (keyed by AUMID)
     textures: HashMap<String, Option<egui::TextureHandle>>,
+    art_accent: (u64, egui::Color32),
 
     // system panel
     sys: System,
@@ -167,7 +172,7 @@ impl EmelkaNotch {
         spawn_antigravity_worker(cc.egui_ctx.clone(), antigravity.clone());
         let screenshot = Arc::new(Mutex::new(load_screenshot_state()));
         spawn_hotkey_worker(cc.egui_ctx.clone(), screenshot.clone());
-        let (style, osd_enabled) = load_settings();
+        let cfg = load_settings();
         let osd = Arc::new(Mutex::new(OsdState::default()));
         spawn_volume_worker(cc.egui_ctx.clone(), osd.clone());
         spawn_brightness_worker(cc.egui_ctx.clone(), osd.clone());
@@ -182,16 +187,20 @@ impl EmelkaNotch {
             tx,
             upd,
             section: Section::Media,
-            style,
-            style_t: if style == NotchStyle::Attached {
+            style: cfg.style,
+            style_t: if cfg.style == NotchStyle::Attached {
                 1.0
             } else {
                 0.0
             },
-            osd_enabled,
+            osd_enabled: cfg.osd,
+            auto_hide: cfg.auto_hide,
+            reveal_height: cfg.reveal_height,
+            reveal_t: if cfg.auto_hide { 0.0 } else { 1.0 },
+            autostart: settings::is_autostart_enabled(),
             osd,
             t: 0.0,
-            panel_cur_h: PANEL_H,
+            panel_cur_h: MEDIA_PANEL_H,
             open: false,
             hover_since: None,
             last_inside: Instant::now(),
@@ -207,6 +216,7 @@ impl EmelkaNotch {
             view_changed: Instant::now(),
             animating: false,
             textures: HashMap::new(),
+            art_accent: (0, ACCENT),
             sys,
             last_refresh: Instant::now(),
             cpu_hist: VecDeque::new(),
@@ -232,7 +242,7 @@ impl EmelkaNotch {
             prev_section: None,
             tab_t: 1.0,
             tab_dir: 1.0,
-            tab_from_h: PANEL_H,
+            tab_from_h: MEDIA_PANEL_H,
             pk_anim: 0.0,
             cur_alpha: 1.0,
             added: None,
@@ -249,12 +259,37 @@ impl EmelkaNotch {
         lerp(TOP, 0.0, self.style_t)
     }
 
+    fn visible_top(&self) -> f32 {
+        lerp(-(self.pill_h + 12.0), self.top(), ease(self.reveal_t))
+    }
+
+    fn has_active_peek(&self) -> bool {
+        let has_notif = self
+            .notifs
+            .lock()
+            .unwrap()
+            .latest
+            .as_ref()
+            .is_some_and(|x| x.at.elapsed() < NOTIF_SHOW);
+        let has_osd = self.osd_enabled
+            && self
+                .osd
+                .lock()
+                .unwrap()
+                .latest
+                .is_some_and(|o| o.at.elapsed() < OSD_SHOW);
+        has_notif || has_osd
+    }
+
     fn section_h(sec: Section) -> f32 {
         match sec {
+            Section::Media => MEDIA_PANEL_H,
+            Section::System => SYSTEM_PANEL_H,
             Section::Weather => WEATHER_PANEL_H,
             Section::Antigravity => ANTIGRAVITY_PANEL_H,
             Section::Screenshot => SCREENSHOT_PANEL_H,
             Section::Prayer => PRAYER_PANEL_H,
+            Section::Settings => SETTINGS_PANEL_H,
             _ => PANEL_H,
         }
     }
@@ -342,7 +377,7 @@ impl EmelkaNotch {
             self.pill_w,
             self.pill_h,
             ease(self.t),
-            self.top(),
+            self.visible_top(),
             self.panel_cur_h,
         );
         let slack = if self.open { 6.0 } else { 28.0 };
@@ -352,7 +387,18 @@ impl EmelkaNotch {
             pos2(cx - half, -10.0),
             pos2(cx + half, shape.bottom() + slack),
         );
-        let over = cursor_local(ctx).map_or(false, |c| hit.contains(c));
+        let cursor = cursor_local(ctx);
+        let trigger_half = (PANEL_W / 2.0).max(160.0);
+        let top_trigger = cursor.map_or(false, |c| {
+            c.y >= -10.0
+                && c.y <= self.reveal_height
+                && (c.x - WIN_W / 2.0).abs() <= trigger_half
+        });
+        let over = if self.auto_hide && self.reveal_t < 0.05 {
+            top_trigger
+        } else {
+            top_trigger || cursor.map_or(false, |c| hit.contains(c))
+        };
         let typing = ctx.input(|i| i.focused) && ctx.memory(|m| m.focused().is_some());
         let inside = over || (typing && self.open);
 
@@ -363,8 +409,28 @@ impl EmelkaNotch {
             self.hover_since = None;
         }
 
+        let dragging = ctx.input(|i| i.pointer.any_down());
+        let peek = self.has_active_peek();
+        let want_reveal = !self.auto_hide
+            || inside
+            || dragging
+            || peek
+            || self.t > 0.12
+            || (self.open && self.last_inside.elapsed() < Duration::from_millis(450));
+        let reveal_step = dt / if want_reveal { 0.24 } else { 0.26 };
+        self.reveal_t = if want_reveal {
+            (self.reveal_t + reveal_step).min(1.0)
+        } else {
+            (self.reveal_t - reveal_step).max(0.0)
+        };
+
         self.open = match self.hover_since {
-            Some(s) if s.elapsed() >= Duration::from_millis(100) => true,
+            Some(s)
+                if s.elapsed() >= Duration::from_millis(100)
+                    && (!self.auto_hide || self.reveal_t >= 0.35) =>
+            {
+                true
+            }
             _ => self.open && self.last_inside.elapsed() < Duration::from_millis(450),
         };
 
@@ -378,8 +444,11 @@ impl EmelkaNotch {
 
         // Let clicks fall through the transparent area below the panel, but keep
         // the window interactive while dragging a control inside it.
-        let dragging = ctx.input(|i| i.pointer.any_down());
-        let want_passthrough = !(inside || dragging);
+        let want_passthrough = if self.auto_hide && self.reveal_t < 0.05 {
+            true
+        } else {
+            !(inside || dragging)
+        };
         if want_passthrough != self.passthrough {
             self.passthrough = want_passthrough;
             ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(want_passthrough));
@@ -525,21 +594,26 @@ impl EmelkaNotch {
             || (self.view.w - self.pill_w).abs() > 0.5
             || (self.view.h - self.pill_h).abs() > 0.5;
 
-        let top = self.top();
+        if self.reveal_t <= 0.001 {
+            return;
+        }
+
+        let top = self.visible_top();
+        let vis_alpha = (self.reveal_t * 2.2).clamp(0.0, 1.0);
         let panel_h = self.panel_cur_h;
         let rect = shape_rect(self.pill_w, self.pill_h, e, top, panel_h);
         let radius = self.corner_radius(e);
 
-        painter.rect_filled(rect, radius, BG);
+        painter.rect_filled(rect, radius, BG.gamma_multiply(vis_alpha));
         painter.rect_stroke(
             rect,
             radius,
-            Stroke::new(1.0, BORDER.gamma_multiply(0.45 + 0.55 * e)),
+            Stroke::new(1.0, BORDER.gamma_multiply((0.45 + 0.55 * e) * vis_alpha)),
             StrokeKind::Inside,
         );
 
         // Collapsed pill content
-        let pill_alpha = (1.0 - e * 3.0).clamp(0.0, 1.0);
+        let pill_alpha = (1.0 - e * 3.0).clamp(0.0, 1.0) * vis_alpha;
         if pill_alpha > 0.0 {
             let v = self.view.clone();
             let fade = (self.view_changed.elapsed().as_secs_f32() / 0.2).clamp(0.0, 1.0);
@@ -642,7 +716,7 @@ impl EmelkaNotch {
         }
 
         // Expanded panel content
-        let panel_alpha = ((e - 0.5) / 0.5).clamp(0.0, 1.0);
+        let panel_alpha = ((e - 0.5) / 0.5).clamp(0.0, 1.0) * vis_alpha;
         if panel_alpha > 0.0 {
             let inner = Rect::from_min_size(
                 pos2((WIN_W - PANEL_W) / 2.0 + PAD, top + PAD),
@@ -784,7 +858,12 @@ impl eframe::App for EmelkaNotch {
             });
 
         let playing = self.shared.lock().unwrap().media.playing;
-        if self.t > 0.0 || self.animating || settings::style_animating(self.style_t) {
+        let reveal_anim = self.reveal_t > 0.001 && self.reveal_t < 0.999;
+        if self.t > 0.0
+            || self.animating
+            || reveal_anim
+            || settings::style_animating(self.style_t)
+        {
             ctx.request_repaint_after(Duration::from_millis(16));
         } else if playing {
             ctx.request_repaint_after(Duration::from_millis(33));

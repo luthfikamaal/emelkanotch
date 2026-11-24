@@ -2,7 +2,50 @@
 // Settings (appearance), stored in %APPDATA%\EmelkaNotch\settings.json
 // =====================================================================
 
+use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
+use std::process::Command;
+
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+const APPROVED_KEY: &str =
+    r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
+const APP_NAME: &str = "EmelkaNotch";
+
+pub(crate) fn is_autostart_enabled() -> bool {
+    Command::new("reg")
+        .args(["query", RUN_KEY, "/v", APP_NAME])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+pub(crate) fn set_autostart(enabled: bool) -> bool {
+    if enabled {
+        let Ok(exe) = std::env::current_exe() else {
+            return false;
+        };
+        let val = format!("\"{}\"", exe.display());
+        let ok = Command::new("reg")
+            .args(["add", RUN_KEY, "/v", APP_NAME, "/t", "REG_SZ", "/d", &val, "/f"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if ok {
+            let _ = Command::new("reg")
+                .args(["delete", APPROVED_KEY, "/v", APP_NAME, "/f"])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output();
+        }
+        ok
+    } else {
+        Command::new("reg")
+            .args(["delete", RUN_KEY, "/v", APP_NAME, "/f"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .is_ok_and(|o| o.status.success())
+    }
+}
 
 /// Floating = pill floating below the top edge. Attached = glued to the top edge of the screen.
 #[derive(Clone, Copy, PartialEq)]
@@ -17,38 +60,72 @@ fn settings_path() -> Option<PathBuf> {
     Some(dir.join("settings.json"))
 }
 
-/// (style, osd_enabled). Missing / broken file -> defaults.
-pub(crate) fn load_settings() -> (NotchStyle, bool) {
-    let mut style = NotchStyle::Floating;
-    let mut osd = true;
-    let Some(p) = settings_path() else {
-        return (style, osd);
-    };
-    let Ok(s) = std::fs::read_to_string(p) else {
-        return (style, osd);
-    };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) else {
-        return (style, osd);
-    };
-    if v.get("style").and_then(|x| x.as_str()) == Some("attached") {
-        style = NotchStyle::Attached;
-    }
-    if let Some(b) = v.get("osd").and_then(|x| x.as_bool()) {
-        osd = b;
-    }
-    (style, osd)
+pub(crate) const DEFAULT_REVEAL_HEIGHT: f32 = 12.0;
+pub(crate) const MIN_REVEAL_HEIGHT: f32 = 2.0;
+pub(crate) const MAX_REVEAL_HEIGHT: f32 = 60.0;
+
+#[derive(Clone, Copy)]
+pub(crate) struct AppSettings {
+    pub style: NotchStyle,
+    pub osd: bool,
+    pub auto_hide: bool,
+    pub reveal_height: f32,
 }
 
-pub(crate) fn save_settings(style: NotchStyle, osd: bool) {
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            style: NotchStyle::Floating,
+            osd: true,
+            auto_hide: false,
+            reveal_height: DEFAULT_REVEAL_HEIGHT,
+        }
+    }
+}
+
+/// Missing / broken file -> defaults.
+pub(crate) fn load_settings() -> AppSettings {
+    let mut cfg = AppSettings::default();
+    let Some(p) = settings_path() else {
+        return cfg;
+    };
+    let Ok(s) = std::fs::read_to_string(p) else {
+        return cfg;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) else {
+        return cfg;
+    };
+    if v.get("style").and_then(|x| x.as_str()) == Some("attached") {
+        cfg.style = NotchStyle::Attached;
+    }
+    if let Some(b) = v.get("osd").and_then(|x| x.as_bool()) {
+        cfg.osd = b;
+    }
+    if let Some(b) = v.get("auto_hide").and_then(|x| x.as_bool()) {
+        cfg.auto_hide = b;
+    }
+    if let Some(h) = v.get("reveal_height").and_then(|x| x.as_f64()) {
+        cfg.reveal_height = (h as f32).clamp(MIN_REVEAL_HEIGHT, MAX_REVEAL_HEIGHT);
+    }
+    cfg
+}
+
+pub(crate) fn save_settings(cfg: AppSettings) {
     let Some(p) = settings_path() else { return };
-    let name = if style == NotchStyle::Attached {
+    let name = if cfg.style == NotchStyle::Attached {
         "attached"
     } else {
         "floating"
     };
     let _ = std::fs::write(
         p,
-        serde_json::json!({ "style": name, "osd": osd }).to_string(),
+        serde_json::json!({
+            "style": name,
+            "osd": cfg.osd,
+            "auto_hide": cfg.auto_hide,
+            "reveal_height": cfg.reveal_height.clamp(MIN_REVEAL_HEIGHT, MAX_REVEAL_HEIGHT).round()
+        })
+        .to_string(),
     );
 }
 
